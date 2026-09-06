@@ -181,6 +181,7 @@ import {
   normalizeUploadAttachmentContentType,
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
+import { evaluateIssueClosePushState } from "../services/issue-close-push-state.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
@@ -11593,6 +11594,42 @@ export function issueRoutes(
       }
     })();
 
+    // AND-73: push-state guard at close. Our done-criteria are commit-local, so
+    // an issue can close green while its commits are unreachable from the branch
+    // a reviewer reads (AND-71 lost ten of them that way). Flag, never block —
+    // every degradation path inside the guard resolves to a null warning.
+    let pushStateWarning: string | null = null;
+    if (existing.status !== "done" && issue.status === "done") {
+      const pushState = await evaluateIssueClosePushState(db, {
+        companyId: issue.companyId,
+        executionWorkspaceId: issue.executionWorkspaceId,
+        projectId: issue.projectId,
+      });
+      pushStateWarning = pushState.warning;
+      if (pushState.probe.kind === "gap") {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.push_state_gap",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            branch: pushState.probe.branch,
+            remoteRef: pushState.probe.remoteRef,
+            aheadCount: pushState.probe.aheadCount,
+            repoPath: pushState.repoPath,
+            warning: pushStateWarning,
+          },
+        }).catch((err) =>
+          logger.warn({ err, issueId: issue.id }, "failed to log push-state gap at issue close"));
+      }
+    }
+
     await queueTaskWatchdogEvaluation(issue, actor.runId);
     const changes = issueResponse.changes ?? {};
     if (prefersMinimalIssueUpdateResponse(req)) {
@@ -11603,10 +11640,11 @@ export function issueRoutes(
         updatedAt: issueResponse.updatedAt,
         changes,
         comment,
+        ...(pushStateWarning ? { pushStateWarning } : {}),
       });
       return;
     }
-    res.json({ ...issueResponse, changes, comment });
+    res.json({ ...issueResponse, changes, comment, ...(pushStateWarning ? { pushStateWarning } : {}) });
   });
 
   router.delete("/issues/:id", async (req, res) => {
