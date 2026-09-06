@@ -2449,6 +2449,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("persists codex_local spawn identity before hot restart and never loses the live run for missing metadata", async () => {
     let releaseAdapter: (() => void) | null = null;
     let spawnedPid: number | null = null;
+    // The spawn time has to be the child's real one: liveness now compares it
+    // against the start time the OS reports for the pid, so a fabricated clock
+    // here would look exactly like a recycled pid (AND-40).
+    let spawnedStartedAt: string | null = null;
     const adapterStarted = new Promise<void>((resolve) => {
       mockAdapterExecute.mockImplementationOnce(async (rawInput?: unknown) => {
         const input = rawInput as {
@@ -2463,10 +2467,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         if (!child.pid)
           throw new Error("Test codex_local child did not expose a pid");
         spawnedPid = child.pid;
+        spawnedStartedAt = new Date().toISOString();
         await input.onSpawn?.({
           pid: child.pid,
           processGroupId: null,
-          startedAt: new Date("2026-07-30T07:00:00.000Z").toISOString(),
+          startedAt: spawnedStartedAt,
         });
         resolve();
         await new Promise<void>((release) => {
@@ -2525,7 +2530,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "running",
       processPid: spawnedPid,
       processGroupId: null,
-      processStartedAt: new Date("2026-07-30T07:00:00.000Z"),
+      processStartedAt: new Date(spawnedStartedAt as unknown as string),
     });
 
     await withTempPaperclipHome(async (home) => {
