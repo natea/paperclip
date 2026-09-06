@@ -8,6 +8,7 @@ import {
   createGitReader,
   evaluateIssueClosePushState,
   formatPushStateWarning,
+  isAttributablePushStateSkip,
   inspectPushState,
   type GitReader,
 } from "../services/issue-close-push-state.js";
@@ -200,25 +201,31 @@ describe("degradation paths", () => {
 });
 
 describe("evaluateIssueClosePushState", () => {
-  const stubDb = {
-    select: () => ({
-      from: () => ({
-        where: () => ({
-          limit: () => ({ then: (resolve: (rows: unknown[]) => unknown) => resolve([]) }),
-        }),
-      }),
-    }),
-  } as never;
+  /** Stands in for a project-workspace lookup that returns `rows`. */
+  function stubDbReturning(rows: unknown[]) {
+    const chain = {
+      where: () => chain,
+      limit: () => ({ then: (resolve: (r: unknown[]) => unknown) => resolve(rows) }),
+      orderBy: () => Promise.resolve(rows),
+    };
+    return { select: () => ({ from: () => chain }) } as never;
+  }
+
+  const stubDb = stubDbReturning([]);
 
   it("returns no warning when the issue resolves to no repo path", async () => {
     expect(await evaluateIssueClosePushState(stubDb, { companyId: "c", projectId: null })).toEqual({
       probe: { kind: "skipped", reason: "no_repo_path" },
       warning: null,
       repoPath: null,
+      repoPathSource: null,
     });
   });
 
-  it("returns no warning when the repo lookup itself throws", async () => {
+  // AND-77: "the lookup broke" used to be reported as "there is no workspace",
+  // which is the one distinction an operator needs to know whether to go fix
+  // their configuration or go fix the database.
+  it("distinguishes a failed repo lookup from an absent workspace", async () => {
     const explodingDb = {
       select: () => {
         throw new Error("db down");
@@ -226,7 +233,7 @@ describe("evaluateIssueClosePushState", () => {
     } as never;
     const result = await evaluateIssueClosePushState(explodingDb, { companyId: "c", projectId: "p" });
     expect(result.warning).toBeNull();
-    expect(result.probe).toEqual({ kind: "skipped", reason: "no_repo_path" });
+    expect(result.probe).toEqual({ kind: "skipped", reason: "repo_lookup_failed" });
   });
 
   it("produces the warning end-to-end for an ahead workspace", async () => {
@@ -236,23 +243,65 @@ describe("evaluateIssueClosePushState", () => {
     await git(dir, "push", "-u", "fork", "work");
     await commit(dir, "unpublished");
 
-    const dbWithPath = {
-      select: () => ({
-        from: () => ({
-          where: () => ({
-            limit: () => ({
-              then: (resolve: (rows: unknown[]) => unknown) => resolve([{ cwd: dir, providerRef: null }]),
-            }),
-          }),
-        }),
-      }),
-    } as never;
-
-    const result = await evaluateIssueClosePushState(dbWithPath, {
-      companyId: "c",
-      projectId: "p",
-    });
+    const result = await evaluateIssueClosePushState(
+      stubDbReturning([{ id: "w1", cwd: dir, isPrimary: true }]),
+      { companyId: "c", projectId: "p" },
+    );
     expect(result.repoPath).toBe(dir);
+    expect(result.repoPathSource).toBe("project_primary");
     expect(result.warning).toContain('branch "work" is 1 commit ahead of fork/work');
+  });
+
+  it("prefers the workspace the issue is pinned to over the project primary", async () => {
+    const pinned = await makeRepo("pinned");
+    const primary = await makeRepo("primary");
+    const result = await evaluateIssueClosePushState(
+      stubDbReturning([
+        { id: "primary", cwd: primary, isPrimary: true },
+        { id: "pinned", cwd: pinned, isPrimary: false },
+      ]),
+      { companyId: "c", projectId: "p", projectWorkspaceId: "pinned" },
+    );
+    expect(result.repoPath).toBe(pinned);
+    expect(result.repoPathSource).toBe("issue_project_workspace");
+  });
+
+  it("falls back to the oldest workspace when the project has no primary", async () => {
+    const oldest = await makeRepo("oldest");
+    const newer = await makeRepo("newer");
+    const result = await evaluateIssueClosePushState(
+      stubDbReturning([
+        { id: "oldest", cwd: oldest, isPrimary: false },
+        { id: "newer", cwd: newer, isPrimary: false },
+      ]),
+      { companyId: "c", projectId: "p" },
+    );
+    expect(result.repoPath).toBe(oldest);
+    expect(result.repoPathSource).toBe("project_fallback");
+  });
+});
+
+describe("isAttributablePushStateSkip", () => {
+  it("is false for the outcomes that answered the question", () => {
+    expect(isAttributablePushStateSkip({ kind: "clean", branch: "w", remoteRef: "f/w" }, { projectId: "p" }))
+      .toBe(false);
+    expect(isAttributablePushStateSkip(
+      { kind: "gap", branch: "w", remoteRef: "f/w", aheadCount: 1 },
+      { projectId: "p" },
+    )).toBe(false);
+  });
+
+  it("is false when there was no checkout to be wrong about", () => {
+    expect(isAttributablePushStateSkip(
+      { kind: "skipped", reason: "no_repo_path" },
+      { projectId: null, executionWorkspaceId: null },
+    )).toBe(false);
+  });
+
+  it("is true when the issue named a repo the guard could not read", () => {
+    expect(isAttributablePushStateSkip({ kind: "skipped", reason: "no_repo_path" }, { projectId: "p" }))
+      .toBe(true);
+    expect(isAttributablePushStateSkip({ kind: "skipped", reason: "git_unavailable" }, { projectId: null }))
+      .toBe(true);
   });
 });

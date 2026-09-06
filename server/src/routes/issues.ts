@@ -181,7 +181,11 @@ import {
   normalizeUploadAttachmentContentType,
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
-import { evaluateIssueClosePushState } from "../services/issue-close-push-state.js";
+import {
+  evaluateIssueClosePushState,
+  isAttributablePushStateSkip,
+  type PushStateProbe,
+} from "../services/issue-close-push-state.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
@@ -11599,13 +11603,55 @@ export function issueRoutes(
     // a reviewer reads (AND-71 lost ten of them that way). Flag, never block —
     // every degradation path inside the guard resolves to a null warning.
     let pushStateWarning: string | null = null;
+    let pushStateProbe: PushStateProbe | null = null;
     if (existing.status !== "done" && issue.status === "done") {
-      const pushState = await evaluateIssueClosePushState(db, {
+      const guardInput = {
         companyId: issue.companyId,
         executionWorkspaceId: issue.executionWorkspaceId,
         projectId: issue.projectId,
-      });
+        projectWorkspaceId: issue.projectWorkspaceId,
+      };
+      const pushState = await evaluateIssueClosePushState(db, guardInput);
       pushStateWarning = pushState.warning;
+      pushStateProbe = pushState.probe;
+      // AND-77: record every outcome, not just the gap. A guard whose skip is
+      // indistinguishable from its all-clear cannot be trusted the first time it
+      // is quiet — the reason, the checkout it read, and which hop chose that
+      // checkout are the three facts needed to tell those apart afterwards.
+      logger.info({
+        issueId: issue.id,
+        identifier: issue.identifier,
+        probeKind: pushState.probe.kind,
+        probeReason: pushState.probe.kind === "skipped" ? pushState.probe.reason : null,
+        repoPath: pushState.repoPath,
+        repoPathSource: pushState.repoPathSource,
+        projectId: issue.projectId ?? null,
+        projectWorkspaceId: issue.projectWorkspaceId ?? null,
+        executionWorkspaceId: issue.executionWorkspaceId ?? null,
+      }, "push-state guard evaluated at issue close");
+      if (isAttributablePushStateSkip(pushState.probe, guardInput)) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.push_state_skipped",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            reason: pushState.probe.reason,
+            repoPath: pushState.repoPath,
+            repoPathSource: pushState.repoPathSource,
+            projectId: issue.projectId ?? null,
+            projectWorkspaceId: issue.projectWorkspaceId ?? null,
+            executionWorkspaceId: issue.executionWorkspaceId ?? null,
+          },
+        }).catch((err) =>
+          logger.warn({ err, issueId: issue.id }, "failed to log push-state skip at issue close"));
+      }
       if (pushState.probe.kind === "gap") {
         await logActivity(db, {
           companyId: issue.companyId,
@@ -11623,6 +11669,7 @@ export function issueRoutes(
             remoteRef: pushState.probe.remoteRef,
             aheadCount: pushState.probe.aheadCount,
             repoPath: pushState.repoPath,
+            repoPathSource: pushState.repoPathSource,
             warning: pushStateWarning,
           },
         }).catch((err) =>
@@ -11641,10 +11688,17 @@ export function issueRoutes(
         changes,
         comment,
         ...(pushStateWarning ? { pushStateWarning } : {}),
+        ...(pushStateProbe ? { pushStateProbe } : {}),
       });
       return;
     }
-    res.json({ ...issueResponse, changes, comment, ...(pushStateWarning ? { pushStateWarning } : {}) });
+    res.json({
+      ...issueResponse,
+      changes,
+      comment,
+      ...(pushStateWarning ? { pushStateWarning } : {}),
+      ...(pushStateProbe ? { pushStateProbe } : {}),
+    });
   });
 
   router.delete("/issues/:id", async (req, res) => {

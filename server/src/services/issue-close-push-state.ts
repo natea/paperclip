@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
-import { and, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, projectWorkspaces } from "@paperclipai/db";
 
@@ -24,6 +24,7 @@ const execFileAsync = promisify(execFile);
 
 export type PushStateSkipReason =
   | "no_repo_path"
+  | "repo_lookup_failed"
   | "not_a_git_repo"
   | "detached_head"
   | "no_remote_ref"
@@ -135,15 +136,44 @@ export function formatPushStateWarning(
 }
 
 /**
- * The repo a close should be measured against: the issue's execution workspace
- * if it has one, otherwise the project's primary workspace (the `project_primary`
- * strategy runs the agent directly in that checkout, and that is the shape that
- * lost the AND-71 commits).
+ * Which hop of {@link resolveIssueCloseRepoPath} produced the repo path. Recorded
+ * alongside every probe: "the guard looked at the wrong checkout" and "the guard
+ * found no checkout" are different bugs, and AND-77 could not tell them apart.
+ */
+export type PushStateRepoSource =
+  | "execution_workspace"
+  | "issue_project_workspace"
+  | "project_primary"
+  | "project_fallback";
+
+export type PushStateRepoResolution = {
+  repoPath: string | null;
+  source: PushStateRepoSource | null;
+  /** True when a lookup threw rather than simply finding nothing. */
+  lookupFailed: boolean;
+};
+
+/**
+ * The repo a close should be measured against, in the same order a run resolves
+ * its anchor workspace (`resolveAnchorWorkspaceForRun`): the issue's execution
+ * workspace, then the workspace the issue is pinned to, then the project's
+ * primary, then the oldest workspace on the project.
+ *
+ * That last hop is AND-77's third finding. The run resolver has always fallen
+ * back to the oldest workspace when no primary is set; a primary-only guard goes
+ * silent on exactly those projects — a run executes somewhere the guard cannot
+ * see, which is the silent-miss shape this whole guard exists to close.
  */
 export async function resolveIssueCloseRepoPath(
   db: Db,
-  issue: { companyId: string; executionWorkspaceId?: string | null; projectId?: string | null },
-): Promise<string | null> {
+  issue: {
+    companyId: string;
+    executionWorkspaceId?: string | null;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+  },
+): Promise<PushStateRepoResolution> {
+  const miss: PushStateRepoResolution = { repoPath: null, source: null, lookupFailed: false };
   try {
     if (issue.executionWorkspaceId) {
       const row = await db
@@ -156,51 +186,115 @@ export async function resolveIssueCloseRepoPath(
         .limit(1)
         .then((rows) => rows[0] ?? null);
       const workspacePath = row?.providerRef?.trim() || row?.cwd?.trim() || null;
-      if (workspacePath) return path.resolve(workspacePath);
+      if (workspacePath) {
+        return { repoPath: path.resolve(workspacePath), source: "execution_workspace", lookupFailed: false };
+      }
     }
 
     if (issue.projectId) {
-      const row = await db
-        .select({ cwd: projectWorkspaces.cwd })
+      const rows = await db
+        .select({
+          id: projectWorkspaces.id,
+          cwd: projectWorkspaces.cwd,
+          isPrimary: projectWorkspaces.isPrimary,
+        })
         .from(projectWorkspaces)
         .where(and(
           eq(projectWorkspaces.projectId, issue.projectId),
           eq(projectWorkspaces.companyId, issue.companyId),
-          eq(projectWorkspaces.isPrimary, true),
         ))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      const workspacePath = row?.cwd?.trim() || null;
-      if (workspacePath) return path.resolve(workspacePath);
+        .orderBy(asc(projectWorkspaces.createdAt), asc(projectWorkspaces.id));
+
+      const usable = rows.filter((row) => (row.cwd?.trim() ?? "") !== "");
+      const pinned = issue.projectWorkspaceId
+        ? usable.find((row) => row.id === issue.projectWorkspaceId) ?? null
+        : null;
+      const primary = usable.find((row) => row.isPrimary === true) ?? null;
+      const chosen = pinned ?? primary ?? usable[0] ?? null;
+      if (chosen) {
+        const source: PushStateRepoSource = chosen === pinned
+          ? "issue_project_workspace"
+          : chosen === primary
+            ? "project_primary"
+            : "project_fallback";
+        return { repoPath: path.resolve(chosen.cwd!.trim()), source, lookupFailed: false };
+      }
     }
   } catch {
-    return null;
+    return { repoPath: null, source: null, lookupFailed: true };
   }
-  return null;
+  return miss;
 }
 
 /**
  * The whole guard, in the shape the close path wants: hand it the issue, get
- * back a warning string or null. Never throws.
+ * back a probe, a warning string or null, and the attribution the caller needs
+ * to explain a quiet outcome. Never throws.
+ *
+ * AND-77: the caller used to keep only the warning, so a skip was
+ * indistinguishable from a clean branch on the wire and in the record. Every
+ * field here exists to be logged, including on the paths that say nothing.
  */
+export type IssueClosePushStateResult = {
+  probe: PushStateProbe;
+  warning: string | null;
+  repoPath: string | null;
+  repoPathSource: PushStateRepoSource | null;
+};
+
 export async function evaluateIssueClosePushState(
   db: Db,
-  issue: { companyId: string; executionWorkspaceId?: string | null; projectId?: string | null },
+  issue: {
+    companyId: string;
+    executionWorkspaceId?: string | null;
+    projectId?: string | null;
+    projectWorkspaceId?: string | null;
+  },
   deps: { gitReaderFor?: (repoPath: string) => GitReader } = {},
-): Promise<{ probe: PushStateProbe; warning: string | null; repoPath: string | null }> {
+): Promise<IssueClosePushStateResult> {
   try {
-    const repoPath = await resolveIssueCloseRepoPath(db, issue);
-    if (!repoPath) {
-      return { probe: { kind: "skipped", reason: "no_repo_path" }, warning: null, repoPath: null };
+    const resolution = await resolveIssueCloseRepoPath(db, issue);
+    if (!resolution.repoPath) {
+      return {
+        probe: {
+          kind: "skipped",
+          reason: resolution.lookupFailed ? "repo_lookup_failed" : "no_repo_path",
+        },
+        warning: null,
+        repoPath: null,
+        repoPathSource: null,
+      };
     }
-    const git = (deps.gitReaderFor ?? createGitReader)(repoPath);
+    const git = (deps.gitReaderFor ?? createGitReader)(resolution.repoPath);
     const probe = await inspectPushState(git);
     return {
       probe,
       warning: probe.kind === "gap" ? formatPushStateWarning(probe) : null,
-      repoPath,
+      repoPath: resolution.repoPath,
+      repoPathSource: resolution.source,
     };
   } catch {
-    return { probe: { kind: "skipped", reason: "git_unavailable" }, warning: null, repoPath: null };
+    return {
+      probe: { kind: "skipped", reason: "git_unavailable" },
+      warning: null,
+      repoPath: null,
+      repoPathSource: null,
+    };
   }
+}
+
+/**
+ * True when the guard had something to measure and still said nothing. A close
+ * on an issue with neither an execution workspace nor a project has no checkout
+ * to be wrong about, and recording that would bury the informative skips.
+ */
+export function isAttributablePushStateSkip(
+  probe: PushStateProbe,
+  issue: { executionWorkspaceId?: string | null; projectId?: string | null },
+): probe is Extract<PushStateProbe, { kind: "skipped" }> {
+  if (probe.kind !== "skipped") return false;
+  if (probe.reason === "no_repo_path") {
+    return Boolean(issue.executionWorkspaceId ?? issue.projectId);
+  }
+  return true;
 }
