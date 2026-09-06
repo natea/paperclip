@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { hostPlatformSupports } from "@paperclipai/shared/testing/platform-support";
 
 import {
   deriveViteHmrPort,
@@ -575,6 +576,13 @@ describe("automatic tailscale_https default for managed worktree runtimes", () =
  * checkout it launched bound `0.0.0.0`, and the server only asked for loopback
  * via env vars that checkout never read.
  */
+// The wildcard-bind refusal is proven by reading /proc/net/tcp: off a procfs
+// host `readListenerBindFacts` returns null, `diagnoseRuntimeListenerBinds`
+// deliberately stays silent ("the server simply cannot explain") and the start
+// therefore succeeds. Tests that assert the *refusal* need the procfs host; the
+// argv-rewrite tests in the same block are platform-independent.
+const itOnProcNet = it.runIf(hostPlatformSupports("proc-net"));
+
 describe("loopback bind is forced on the guest, not merely requested (PAP-17256)", () => {
   it("starts a fresh service-index-0 lane whose guest only honours argv", async () => {
     const { broker, calls } = createBroker();
@@ -612,7 +620,7 @@ describe("loopback bind is forced on the guest, not merely requested (PAP-17256)
     expect(calls).toEqual(["reserve", "expose", "remove"]);
   }, 20_000);
 
-  it("reaches a terminal failure naming the port and address when a guest still binds the wildcard", async () => {
+  itOnProcNet("reaches a terminal failure naming the port and address when a guest still binds the wildcard", async () => {
     const { broker, calls } = createBroker();
     installDeps({ broker });
 
@@ -630,7 +638,7 @@ describe("loopback bind is forced on the guest, not merely requested (PAP-17256)
     expect(calls).toEqual(["reserve", "remove"]);
   }, 20_000);
 
-  it("explains rather than only coding the failure, so the next operator can act", async () => {
+  itOnProcNet("explains rather than only coding the failure, so the next operator can act", async () => {
     const { broker } = createBroker();
     installDeps({ broker });
 
@@ -726,7 +734,7 @@ describe("readiness probes loopback for an exposed runtime (PAP-17256)", () => {
 });
 
 describe("the deployed failure shape: loopback app port, wildcard HMR (PAP-17256)", () => {
-  it("fails terminally naming the HMR port, because forcing the bind cannot reach Vite's own listener", async () => {
+  itOnProcNet("fails terminally naming the HMR port, because forcing the bind cannot reach Vite's own listener", async () => {
     // Plain master's app.ts passes Vite `hmr.port` without `hmr.server` or
     // `server.host`, so the HMR websocket binds `::` no matter what the bind mode
     // is. The argv rewrite fixes the app port; only the preflight catches this.
