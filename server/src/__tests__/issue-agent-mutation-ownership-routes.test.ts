@@ -177,7 +177,14 @@ function registerRouteMocks() {
     documentService: () => mockDocumentService,
   }));
 
-  vi.doMock("../services/issues.js", () => ({
+  // AND-59: keep the real module's other exports alive. `routes/issues.ts`
+  // also imports value exports from here (`logExecutionLockLoss`, the
+  // diagnostics limits, `readAcceptedPlanConfirmationTarget`), and a factory
+  // that returns only `issueService` makes every one of those a hard
+  // "No export is defined on the mock" throw the moment a route reaches it —
+  // which turned the peer-checkout 409 into an unhandled 500.
+  vi.doMock("../services/issues.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../services/issues.js")>()),
     issueService: () => mockIssueService,
   }));
 
@@ -865,6 +872,20 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
     expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    // AND-59: a refusal that leaves no evidence row reads downstream as an
+    // outage rather than a boundary, which is exactly how the unhandled 500
+    // presented. Pin the denial evidence to the same assertion table.
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        action: "issue.write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        agentId: peerAgentId,
+        details: expect.objectContaining({ code: "issue_write_assignee_run_lock" }),
+      }),
+    );
   });
 
   // AND-12: the run lock is run-scoped, not status-scoped. When the run holding
