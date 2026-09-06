@@ -710,4 +710,100 @@ describe("issue graph liveness classifier", () => {
       recoveryIssueId: reviewIssueId,
     });
   });
+
+  it("flags an in_review issue with no assignee at all and falls back to the root agent as owner", () => {
+    const reviewIssueId = "review-1";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: reviewIssueId,
+          identifier: "AND-51",
+          title: "Unassigned review",
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          createdByAgentId: null,
+          executionState: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: reviewIssueId,
+      state: "in_review_without_action_path",
+      severity: "critical",
+      recoveryIssueId: reviewIssueId,
+      recommendedOwnerAgentId: managerId,
+      incidentKey: `harness_liveness:${companyId}:${reviewIssueId}:in_review_without_action_path:${reviewIssueId}`,
+    });
+    expect(findings[0]?.reason).toContain("no assignee at all");
+    expect(findings[0]?.recommendedOwnerCandidates[0]).toEqual({
+      agentId: managerId,
+      reason: "root_agent",
+      sourceIssueId: reviewIssueId,
+    });
+  });
+
+  it("prefers the creator chain over the root fallback for an unassigned in_review issue", () => {
+    const reviewIssueId = "review-1";
+    const leadId = "lead-1";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: reviewIssueId,
+          identifier: "AND-51",
+          title: "Unassigned review",
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: null,
+          createdByAgentId: coderId,
+          executionState: null,
+        }),
+      ],
+      relations: [],
+      agents: [
+        agent({ reportsTo: leadId }),
+        agent({ id: leadId, name: "Lead", role: "lead", reportsTo: managerId }),
+        manager,
+      ],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      state: "in_review_without_action_path",
+      recommendedOwnerAgentId: leadId,
+    });
+    expect(findings[0]?.recommendedOwnerCandidates.slice(0, 2)).toEqual([
+      { agentId: leadId, reason: "creator_reporting_chain", sourceIssueId: reviewIssueId },
+      { agentId: managerId, reason: "creator_reporting_chain", sourceIssueId: reviewIssueId },
+    ]);
+  });
+
+  it("still treats a user owner as an action path on an unassigned in_review issue", () => {
+    const reviewIssueId = "review-1";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: reviewIssueId,
+          identifier: "AND-51",
+          title: "Unassigned review with a human owner",
+          status: "in_review",
+          assigneeAgentId: null,
+          assigneeUserId: "user-1",
+          createdByAgentId: null,
+          executionState: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toEqual([]);
+  });
 });

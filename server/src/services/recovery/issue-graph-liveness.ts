@@ -585,12 +585,14 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    if (!reviewIssue.assigneeAgentId || reviewIssue.assigneeUserId) return null;
+    if (reviewIssue.assigneeUserId) return null;
 
     return finding({
       issue: source,
       state: "in_review_without_action_path",
-      reason: `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`,
+      reason: reviewIssue.assigneeAgentId
+        ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`
+        : `${issueLabel(reviewIssue)} is in review with no assignee at all and no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`,
       dependencyPath,
       recoveryIssue: reviewIssue,
       recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
