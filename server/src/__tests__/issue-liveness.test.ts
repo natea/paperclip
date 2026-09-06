@@ -807,3 +807,206 @@ describe("issue graph liveness classifier", () => {
     expect(findings).toEqual([]);
   });
 });
+
+describe("unassigned backlog/todo wake-path classifier (AND-53)", () => {
+  const strandedId = "stranded-1";
+  const parentId = "parent-1";
+
+  function unassignedBacklog(overrides: Record<string, unknown> = {}) {
+    return issue({
+      id: strandedId,
+      identifier: "AND-48",
+      title: "Split-out child",
+      status: "backlog",
+      assigneeAgentId: null,
+      assigneeUserId: null,
+      createdByAgentId: null,
+      executionState: null,
+      ...overrides,
+    });
+  }
+
+  it("flags an unassigned backlog issue with no wake path and a stable incident key", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [unassignedBacklog()],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: strandedId,
+      state: "unassigned_without_wake_path",
+      severity: "warning",
+      recoveryIssueId: strandedId,
+      recommendedOwnerAgentId: managerId,
+      incidentKey: `harness_liveness:${companyId}:${strandedId}:unassigned_without_wake_path:${strandedId}`,
+    });
+    expect(findings[0]?.dependencyPath).toEqual([
+      { issueId: strandedId, identifier: "AND-48", title: "Split-out child", status: "backlog" },
+    ]);
+  });
+
+  it("flags an unassigned todo issue the same way", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [unassignedBacklog({ status: "todo" })],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ state: "unassigned_without_wake_path", severity: "warning" });
+  });
+
+  it("escalates to critical when the parent already reached done in the issue set", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        unassignedBacklog({ parentId }),
+        issue({ id: parentId, identifier: "AND-47", title: "Closed parent", status: "done", assigneeAgentId: coderId }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({ issueId: strandedId, state: "unassigned_without_wake_path", severity: "critical" });
+    expect(findings[0]?.reason).toContain("parent that already reached done");
+  });
+
+  it("escalates on parentStatus when the caller's issue set omits the closed parent", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [unassignedBacklog({ parentId, parentStatus: "done" })],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings[0]).toMatchObject({ severity: "critical" });
+  });
+
+  it("stays a warning when the parent is still open", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        unassignedBacklog({ parentId }),
+        issue({ id: parentId, identifier: "AND-47", title: "Open parent", status: "in_progress" }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings.filter((entry) => entry.issueId === strandedId)).toMatchObject([
+      { state: "unassigned_without_wake_path", severity: "warning" },
+    ]);
+  });
+
+  it.each([
+    ["an agent assignee", { assigneeAgentId: coderId }],
+    ["a human owner", { assigneeUserId: "user-1" }],
+  ])("does not flag an issue that has %s", (_label, overrides) => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [unassignedBacklog(overrides)],
+      relations: [],
+      agents: [agent(), manager],
+    });
+
+    expect(findings.filter((entry) => entry.state === "unassigned_without_wake_path")).toEqual([]);
+  });
+
+  it.each([
+    ["a pending interaction", { pendingInteractions: [{ companyId, issueId: strandedId, status: "pending" }] }],
+    ["a pending approval", { pendingApprovals: [{ companyId, issueId: strandedId, status: "pending" }] }],
+    ["an open recovery issue", { openRecoveryIssues: [{ companyId, issueId: strandedId, status: "todo" }] }],
+    ["an active run", { activeRuns: [{ companyId, issueId: strandedId, agentId: coderId, status: "running" }] }],
+    ["a queued wake", { queuedWakeRequests: [{ companyId, issueId: strandedId, agentId: coderId, status: "pending" }] }],
+  ])("does not flag an issue that already has %s", (_label, paths) => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [unassignedBacklog()],
+      relations: [],
+      agents: [agent(), manager],
+      ...paths,
+    });
+
+    expect(findings).toEqual([]);
+  });
+
+  it("ignores waiting paths belonging to another company", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [unassignedBacklog()],
+      relations: [],
+      agents: [agent(), manager],
+      pendingInteractions: [{ companyId: "other-company", issueId: strandedId, status: "pending" }],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]?.state).toBe("unassigned_without_wake_path");
+  });
+
+  it("does not double-report an unassigned blocker already covered by the blocked-chain scan", () => {
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue(),
+        unassignedBacklog({ id: blockerId, identifier: "PAP-1704" }),
+      ],
+      relations: blocks,
+      agents: [agent(), manager],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: blockedId,
+      state: "blocked_by_unassigned_issue",
+      recoveryIssueId: blockerId,
+    });
+  });
+
+  it("does not flag statuses outside backlog/todo", () => {
+    for (const status of ["in_progress", "blocked", "done", "cancelled"]) {
+      const findings = classifyIssueGraphLiveness({
+        issues: [unassignedBacklog({ status })],
+        relations: [],
+        agents: [agent(), manager],
+      });
+      expect(findings.filter((entry) => entry.state === "unassigned_without_wake_path")).toEqual([]);
+    }
+  });
+});
+
+// The board's "one addition" on AND-53: an in_review issue assigned to an agent with
+// monitorNextCheckAt null, no executionState and no pending interaction — AND-52's own state.
+// That is already the `in_review_without_action_path` branch AND-51 added, not a new code path,
+// so this pins the coverage rather than adding a second finding.
+describe("assigned in_review issue with no monitor (AND-52 shape)", () => {
+  it("is already covered by in_review_without_action_path", () => {
+    const reviewIssueId = "review-and-52";
+
+    const findings = classifyIssueGraphLiveness({
+      issues: [
+        issue({
+          id: reviewIssueId,
+          identifier: "AND-52",
+          title: "Platform hardening, tranche 4",
+          status: "in_review",
+          assigneeAgentId: coderId,
+          assigneeUserId: null,
+          executionState: null,
+          monitorNextCheckAt: null,
+        }),
+      ],
+      relations: [],
+      agents: [agent(), manager],
+      pendingInteractions: [],
+      pendingApprovals: [],
+      activeRuns: [],
+      queuedWakeRequests: [],
+      openRecoveryIssues: [],
+    });
+
+    expect(findings).toHaveLength(1);
+    expect(findings[0]).toMatchObject({
+      issueId: reviewIssueId,
+      state: "in_review_without_action_path",
+      severity: "critical",
+      recoveryIssueId: reviewIssueId,
+    });
+    expect(findings[0]?.reason).toContain("with an agent assignee but no participant");
+  });
+});
