@@ -4195,13 +4195,21 @@ export function issueRoutes(
         return true;
       }
       if (issue.status === "in_progress") {
-        // Run/checkout ownership stays assignee-scoped even though writes are
-        // open, so this lock clears on its own — the copy routes to comments.
-        return denyIssueWrite(req, res, issue, "issue_write_assignee_run_lock", {
-          issueId: issue.id,
-          assigneeAgentId: issue.assigneeAgentId,
-          actorAgentId,
-        });
+        // AND-12: the lock is run-scoped, not status-scoped. Clear whichever
+        // locks point at a terminal (or missing) run first, then judge the
+        // refusal against what is genuinely still held — otherwise a run that
+        // dies mid-flight refuses every non-assignee actor forever, while the
+        // denial copy below promises the lock "clears on its own".
+        const heldRunLocks = await svc.releaseTerminalRunLocks(issue.id);
+        if (heldRunLocks.checkoutRunId || heldRunLocks.executionRunId) {
+          // Run/checkout ownership stays assignee-scoped even though writes are
+          // open, so this lock clears on its own — the copy routes to comments.
+          return denyIssueWrite(req, res, issue, "issue_write_assignee_run_lock", {
+            issueId: issue.id,
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+          });
+        }
       }
       // Past the run lock the issue is idle, so only channels that have not
       // adopted the default-open rule still refuse another agent's issue.

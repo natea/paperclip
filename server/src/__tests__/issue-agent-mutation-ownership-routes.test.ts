@@ -29,11 +29,15 @@ const mockIssueService = vi.hoisted(() => ({
   listAttachments: vi.fn(),
   listComments: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  releaseTerminalRunLocks: vi.fn(),
   remove: vi.fn(),
   removeAttachment: vi.fn(),
   update: vi.fn(),
   findMentionedAgents: vi.fn(),
 }));
+
+/** The run lock these suites exercise is held by a live run (AND-12). */
+const liveRunLock = { checkoutRunId: "run-live-1", executionRunId: null };
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
@@ -482,6 +486,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listAttachments.mockReset();
     mockIssueService.listComments.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueService.releaseTerminalRunLocks.mockReset();
+    mockIssueService.releaseTerminalRunLocks.mockResolvedValue(liveRunLock);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockReset();
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireStaleRequestConfirmationsForIssueDocument.mockReset();
@@ -837,6 +843,42 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+  });
+
+  // AND-12: the run lock is run-scoped, not status-scoped. When the run holding
+  // the checkout is terminal the lock must release rather than refuse every
+  // non-assignee actor forever — the denial copy already promises it "clears on
+  // its own", and before this nothing cleared it.
+  it("stops refusing a peer agent once the holding run is terminal", async () => {
+    mockIssueService.releaseTerminalRunLocks.mockResolvedValue({
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Corrected by a peer" });
+
+    expect(mockIssueService.releaseTerminalRunLocks).toHaveBeenCalledWith(issueId);
+    expect(res.status, JSON.stringify(res.body)).not.toBe(409);
+    expect(res.body?.details?.code).not.toBe("issue_write_assignee_run_lock");
+  });
+
+  // The other half of the same boundary: a dead run releases, a live one does
+  // not. Without this the fix above could degrade into "never lock at all".
+  it("still refuses a peer agent while the holding run is live", async () => {
+    mockIssueService.releaseTerminalRunLocks.mockResolvedValue({
+      checkoutRunId: "run-live-1",
+      executionRunId: null,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("allows mentioned peer agents to post comments without ownership of an active checkout", async () => {

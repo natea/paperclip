@@ -5529,6 +5529,30 @@ export function issueService(db: Db) {
     });
   }
 
+  // Route-facing composite for the non-assignee run-lock boundary
+  // (assertAgentIssueMutationAllowed). The lock is run-scoped, not
+  // status-scoped: clear whichever locks point at a terminal (or missing)
+  // heartbeat run, then report what is genuinely still held so callers can deny
+  // on a live run only. Without this a run that dies, or that finishes without
+  // moving the issue out of `in_progress`, locks the issue against every
+  // non-assignee actor forever.
+  async function releaseTerminalRunLocks(issueId: string): Promise<{
+    checkoutRunId: string | null;
+    executionRunId: string | null;
+  }> {
+    await clearExecutionRunIfTerminal(issueId);
+    await clearCheckoutRunIfTerminal(issueId);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    return {
+      checkoutRunId: row?.checkoutRunId ?? null,
+      executionRunId: row?.executionRunId ?? null,
+    };
+  }
+
   async function addStopRelayCommentIfNeeded(
     child: typeof issues.$inferSelect,
     dbOrTx: any = db,
@@ -5627,6 +5651,7 @@ export function issueService(db: Db) {
   return {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
+    releaseTerminalRunLocks,
     addStopRelayCommentIfNeeded,
 
     list: async (companyId: string, filters?: IssueFilters) => {
