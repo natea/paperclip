@@ -200,6 +200,7 @@ import {
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { bindRunToIssue } from "../services/run-issue-binding.js";
 import {
   ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
@@ -11632,6 +11633,31 @@ export function issueRoutes(
       throw error;
     }
     const actor = getActorInfo(req);
+    // AND-22: checking an issue out *is* the run declaring its task, so record
+    // it in the run's context. A scheduler-driven heartbeat wakes with no issue
+    // in `contextSnapshot`; without this it can move an issue to `in_progress`
+    // and then be refused every comment or status update that would explain or
+    // undo that (`cross_issue_influence_run_not_task_bound`), whose sanctioned
+    // path is this checkout. Binding is one-way, so it cannot be used to
+    // re-point a run at each target in turn and evade the cross-issue cap.
+    if (updated && checkoutRunId && req.actor.type === "agent" && req.actor.agentId) {
+      try {
+        const binding = await bindRunToIssue(db, {
+          companyId: issue.companyId,
+          runId: checkoutRunId,
+          agentId: req.actor.agentId,
+          issueId: issue.id,
+          source: "issue.checkout",
+        });
+        if (binding.outcome === "bound") {
+          logger.debug({ runId: checkoutRunId, issueId: issue.id }, "bound run to checked-out issue");
+        }
+      } catch (err) {
+        // Never fail an otherwise-successful checkout on the binding: the write
+        // path degrades to the pre-AND-22 behaviour, it does not break.
+        logger.warn({ err, runId: checkoutRunId, issueId: issue.id }, "failed to bind run to checked-out issue");
+      }
+    }
     if (updated?.harnessKind === "skill_test") {
       await companySkillsSvc.markTestRunRunning(updated.companyId, updated.id);
     }
