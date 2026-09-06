@@ -546,7 +546,7 @@ describe("issue execution policy routes", () => {
     expect(activityTx).toBe(updateTx);
   });
 
-  it("rejects a review binding to a confirmation from another run", async () => {
+  it("binds a confirmation this agent opened in an earlier run to the review transition", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -565,8 +565,62 @@ describe("issue execution policy routes", () => {
       kind: "request_confirmation",
       status: "pending",
       createdByAgentId: "33333333-3333-4333-8333-333333333333",
+      // Opened in the previous heartbeat's run; the actor below is the next wake.
       sourceRunId: "44444444-4444-4444-8444-444444444444",
-      payload: { version: 1, prompt: "Approve another run's request?" },
+      payload: { version: 1, prompt: "Approve this review?" },
+    }]);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "in_review",
+        reviewInteractionId: "11111111-1111-4111-8111-111111111111",
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({
+          reviewInteractionId: "11111111-1111-4111-8111-111111111111",
+        }),
+      }),
+      expect.any(Array),
+    );
+  });
+
+  it("rejects a review binding to a confirmation created by another agent", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1004",
+      title: "Pending confirmation",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([{
+      id: "11111111-1111-4111-8111-111111111111",
+      kind: "request_confirmation",
+      status: "pending",
+      createdByAgentId: "66666666-6666-4666-8666-666666666666",
+      sourceRunId: "44444444-4444-4444-8444-444444444444",
+      payload: { version: 1, prompt: "Approve another agent's request?" },
     }]);
 
     const res = await request(await createApp({
@@ -583,7 +637,7 @@ describe("issue execution policy routes", () => {
 
     expect(res.status).toBe(422);
     expect(res.body).toMatchObject({
-      error: expect.stringContaining("created by this agent run"),
+      error: expect.stringContaining("created by another agent"),
       details: { code: "invalid_review_interaction" },
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();
@@ -971,6 +1025,57 @@ describe("issue execution policy routes", () => {
     expect(updatePatch.executionState).toBeNull();
     expect(updatePatch.assigneeAgentId).toBe("55555555-5555-4555-8555-555555555555");
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
+  });
+
+  // AND-57 invariant: a 2xx from PATCH /api/issues/{id} means every field in
+  // the request body was applied. A workflow repair may add fields, but it may
+  // never silently replace one the caller sent — a refusal has to surface as a
+  // non-2xx (the escalated-hold and stage-advance branches already throw 422).
+  it("applies the caller's explicit status when a stranded review is dissolved in the same PATCH", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      reviewPolicy: null,
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1057",
+      title: "Stranded review with an explicit terminal status",
+      // Every participant of the only stage has been removed, so the stored
+      // policy normalizes to null while the pending execution state survives.
+      executionPolicy: { stages: [] },
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+        returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    // The repair still runs...
+    expect(updatePatch.executionState).toBeNull();
+    // ...but the caller's status is what persists, and what the 200 reports.
+    expect(updatePatch.status).toBe("done");
+    expect(updatePatch.assigneeAgentId).toBeUndefined();
+    expect(res.body.status).toBe("done");
   });
 
   it("does not auto-start execution review when reviewers are added to an already in_review issue", async () => {

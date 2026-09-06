@@ -19,6 +19,7 @@ import type {
   AdditionalSourceStagingFailure,
   SandboxAdditionalSource,
 } from "./sandbox-managed-runtime.js";
+import type { RunProcessSpawnMeta } from "./types.js";
 export {
   resolveReferencedSourceIgnore,
 } from "./sandbox-managed-runtime.js";
@@ -260,7 +261,7 @@ export interface AdapterExecutionTargetProcessOptions {
   graceSec: number;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;
-  onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  onSpawn?: (meta: RunProcessSpawnMeta) => Promise<void>;
   terminalResultCleanup?: TerminalResultCleanupOptions;
   /**
    * Sandbox-only: factory from the Paperclip bridge handle that streams the
@@ -838,7 +839,16 @@ export async function runAdapterExecutionTargetProcess(
         // runner's end-of-run batched onLog to avoid duplicate log bytes.
         onLog: runLogTail ? undefined : options.onLog,
         onSpawn: options.onSpawn
-          ? async (meta) => options.onSpawn?.({ ...meta, processGroupId: null })
+          ? async (meta) =>
+            options.onSpawn?.({
+              ...meta,
+              // The remote runner owns the provider process on the far side of
+              // a transport this server holds open; there is no local process
+              // group to re-adopt, so the run is reported as bound to this
+              // server rather than as an adoptable detached group.
+              processGroupId: null,
+              processTopology: "server_stdio",
+            })
           : undefined,
       });
       // Settle the duplex run disposition synchronously at the clean-completion

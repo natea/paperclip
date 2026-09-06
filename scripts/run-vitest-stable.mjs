@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, statSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readdirSync, realpathSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -275,8 +275,17 @@ function runVitest(args, label) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
-  const testRoot = mkdtempSync(path.join(tempRootParent, `pcvt-${process.pid}-${invocationIndex}-`));
-  // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
+  // Realpath the root. On macOS `/tmp` is a symlink to `/private/tmp` (as
+  // `/var` is to `/private/var`). Code under test realpaths the roots it
+  // reports, so handing tests a `/tmp/...` TMPDIR makes any assertion that
+  // compares a fixture path against a reported path fail permanently on a Mac
+  // with a `/tmp` vs `/private/tmp` diff — a false red no commit can fix.
+  // Kept compact so Unix socket fixtures stay under the macOS 104-byte
+  // sun_path limit: `/private/tmp/pcvt-<pid>-<n>-XXXXXX/t/` is ~35 bytes, so a
+  // fixture still has ~69 bytes of headroom.
+  const testRoot = realpathSync(
+    mkdtempSync(path.join(tempRootParent, `pcvt-${process.pid}-${invocationIndex}-`)),
+  );
   const env = {
     ...process.env,
     NODE_ENV: "test",

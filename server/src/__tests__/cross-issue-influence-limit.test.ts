@@ -10,6 +10,7 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  targetIssueRows: Array<Record<string, unknown>> = [],
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -20,6 +21,15 @@ function counterDb(
           if (Object.keys(selection).includes("count")) {
             return {
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
+            };
+          }
+          // AND-22/AND-25: an unbound run looks the target issue up to see
+          // whether it holds that issue's checkout or execution lock. This fake
+          // owns nothing, so the lookup comes back empty and the run stays
+          // unbound — which is what these fail-closed cases are asserting.
+          if (Object.keys(selection).includes("checkoutRunId")) {
+            return {
+              then: (resolve: (rows: unknown[]) => unknown) => resolve(targetIssueRows),
             };
           }
           return {
@@ -198,7 +208,7 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  it("fails closed when the persisted run has no source issue and owns no lock", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -209,8 +219,29 @@ describe("cross-issue influence limit rollout", () => {
       kind: "update",
     })).rejects.toMatchObject({
       status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      // AND-25: distinct from the run-context code on purpose. The header was
+      // accepted and the run resolved — what is missing is a task, so the copy
+      // must send the caller to checkout, not back to the header it already set.
+      details: { code: "cross_issue_influence_run_not_task_bound" },
     });
+    expect(fake.inserted).toEqual([]);
+  });
+
+  it("lets a run with no source issue write to the issue it holds the checkout lock on", async () => {
+    // AND-25 acceptance shape at the service boundary: a scheduler-driven run
+    // that checked the target out is writing to its own task, which is not
+    // cross-issue influence and must not be counted or refused.
+    const fake = counterDb(0, { contextSnapshot: {} }, [
+      { checkoutRunId: "11111111-1111-4111-8111-111111111111", executionRunId: null },
+    ]);
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+    })).resolves.toBeNull();
     expect(fake.inserted).toEqual([]);
   });
 });

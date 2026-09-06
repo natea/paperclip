@@ -1,0 +1,203 @@
+# Push-state guard at issue close
+
+## What it does
+
+When `PATCH /api/issues/:id` transitions an issue into `done`, the server runs
+`evaluateIssueClosePushState` (`server/src/services/issue-close-push-state.ts`).
+It resolves the issue's repo, compares `HEAD` against every local
+remote-tracking ref carrying the current branch name, takes the smallest gap,
+and on a non-zero gap:
+
+- returns `pushStateWarning` on the PATCH response, and
+- records an `issue.push_state_gap` activity row.
+
+It flags, it never blocks, and every failure mode — no repo, not a git
+checkout, detached HEAD, no remote-tracking ref, git absent — degrades to a
+null warning. Landed by AND-73 (`8b3b4510a`).
+
+Degrading to a null warning is not the same as degrading to silence, and AND-77
+is why. Every close now carries its outcome:
+
+- `pushStateProbe` on the PATCH response for **every** outcome the guard
+  reaches — `gap`, `clean`, or `{ kind: "skipped", reason }`. Its absence means
+  the guard did not run at all (not a close, or already `done`).
+- a `logger.info` line, `"push-state guard evaluated at issue close"`, carrying
+  `probeKind`, `probeReason`, `repoPath`, `repoPathSource`, and the three ids
+  the resolution reads.
+- an `issue.push_state_skipped` activity row for any skip on an issue that
+  *named* a repo — i.e. every skip except `no_repo_path` on an issue with
+  neither a project nor an execution workspace, which has no checkout to be
+  wrong about and would otherwise bury the informative skips.
+
+The reason this matters more than ordinary telemetry: a guard whose failure
+mode is indistinguishable from its success mode cannot be trusted after the
+first time it is quiet. AND-77 spent a session unable to decide, from the
+outside, whether a quiet close meant "nothing to report" or "I could not
+look" — which is the same shape AND-71 was about.
+
+The problem it exists for: our done-criteria are commit-local. An issue closes
+when its commit exists and its suite is green, and nothing checks that the
+commit is reachable from the branch a reviewer actually reads. AND-71 measured
+the cost — ten commits across eight `done` issues sat unpushed while the board
+read them as shipped.
+
+## What it needs in order to be live
+
+The guard is only as good as `resolveIssueCloseRepoPath`, which reads, in the
+same order a run resolves its anchor workspace (AND-77 item 3):
+
+1. the issue's execution workspace (`execution_workspaces.provider_ref`, else `.cwd`),
+2. the project workspace the issue is pinned to (`issues.project_workspace_id`),
+3. the primary workspace of the issue's project (`project_workspaces.cwd` where `is_primary`),
+4. otherwise the oldest workspace on the project.
+
+The hop that answered is reported as `repoPathSource`
+(`execution_workspace` | `issue_project_workspace` | `project_primary` |
+`project_fallback`) on the log line and on both activity rows, so "the guard
+read the wrong checkout" and "the guard found no checkout" are different
+records rather than the same silence.
+
+If an issue has none of these, the guard resolves no path and returns
+`{ kind: "skipped", reason: "no_repo_path" }`. A lookup that *throws* returns
+`repo_lookup_failed` instead — configuration problems and database problems
+are not the same problem.
+
+**A company where agents `cd` into a checkout the control plane has never been
+told about gets a skip, not protection** — which is exactly the shape that lost
+the AND-71 commits. Since AND-77 that skip is at least recorded rather than
+silent, but a recorded skip still protects nothing.
+
+So the guard has a deployment precondition, not just a code path: the checkout
+agents actually commit to must be registered, and issues must be attached to
+the project that owns it.
+
+## Registration (AND-74)
+
+For this instance the `Onboarding` project
+(`c3673955-8747-4e06-9357-1d4ca639186e`) now carries a primary workspace:
+
+| field | value |
+| --- | --- |
+| `name` | `paperclip (CTO checkout)` |
+| `sourceType` | `local_path` |
+| `cwd` | `/Users/backlit/Documents/code/paperclip` |
+| `isPrimary` | `true` |
+
+Issues must also carry `projectId` for the project hops to fire.
+Issues created outside a project (`projectId: null`) remain invisible to the
+guard — attaching them is part of closing the loop, not an automatic
+consequence of registering the workspace.
+
+## The routing consequence, and why it was accepted
+
+A registered primary workspace is not inert. Under the `project_primary`
+workspace strategy, `resolveAnchorWorkspaceForRun`
+(`server/src/services/heartbeat.ts`) prefers a project workspace whose `cwd`
+exists over the `agent_home` fallback. Registering one therefore moves the run
+cwd for **every** run of a project-attached issue, for every agent — not just
+for the guard.
+
+What was checked before accepting that:
+
+- **No materialization.** `resolveConfiguredOrManagedProjectCwd` returns a
+  configured `cwd` verbatim; it only falls through to a managed checkout
+  (clone) when `cwd` is null or the repo-only sentinel. Registering a
+  `local_path` workspace does not clone, reset, or otherwise touch the tree.
+- **No worktree isolation.** With `executionWorkspacePolicy: null` on the
+  project and no issue-level settings, `resolveExecutionWorkspaceMode` returns
+  `shared_workspace`. Runs land in the checkout directly; no per-issue worktree
+  is created off it.
+- **No serialization.** The shared-workspace holder gate only fires when the
+  issue carries `projectWorkspaceId`. Issues here carry `projectId` only, so
+  runs are not deferred with `WorkspaceBusyDeferral`. Even if they did,
+  `sharedWorkspaceConcurrency` resolves to `auto`, which for the `local`
+  environment driver dispatches alongside a live holder with a
+  "coordinate via commits" note rather than serializing.
+- **Bounded blast radius.** Two agents exist in this company (CTO, Chief of
+  Staff), and 42 of 74 issues already carried `projectId: Onboarding` before
+  this change — so those runs were going to move on the next heartbeat either
+  way. Registration makes an existing exposure observed rather than creating a
+  new one.
+- **Session resume survives it.** A session saved under the `agent_home`
+  fallback is migrated with an explicit "Project workspace is now available"
+  warning rather than being dropped.
+
+The residual risk is real and is not designed away: two agents' runs can now
+occupy the same working tree concurrently, and git races (index.lock, branch
+switching under another run's feet) are possible. The mitigation today is
+convention plus the concurrent-holder note, not a lock.
+
+## Alternatives considered
+
+- **Resolve the repo from the run's recorded cwd.** Rejected because it does
+  not work for the shape that motivated the guard: the CTO's run cwd *is*
+  `agent_home`, which is not a git repo. The agent reaches the checkout with a
+  `cd`, which the control plane never sees. This alternative would have left
+  the guard just as inert while looking like a fix.
+- **Leave the guard inert and keep the manual `rev-list` check.** Rejected:
+  the manual check is precisely what AND-71 showed is skipped on the heartbeat
+  where it matters most.
+- **Register the workspace on a new project used only by the CTO.** Would have
+  narrowed the routing change, but produces the same run-cwd move for every
+  issue attached to it and leaves the existing 42 project-attached issues
+  unguarded. Not worth a second project.
+
+## Resolver narrowing, closed by AND-77
+
+`resolveIssueCloseRepoPath` used to accept only a workspace with
+`is_primary = true`, while `resolveAnchorWorkspaceForRun` falls back to the
+oldest workspace when no primary is set. A project with workspaces but no
+primary would place runs in a checkout the guard could not see. It now takes
+the same four hops the run resolver takes (see above), so the two agree.
+
+## Why the guard was silent on AND-74 (AND-77)
+
+AND-77 reported two closes ~1 minute apart on the same repo, branch, gap and
+project, where AND-76 (18:24:42) flagged and AND-74 (18:25:38, again 18:27:10)
+did not. The cause was not in the guard.
+
+**Two server processes were serving the same database on two ports, from two
+different vintages of this repo.**
+
+| | pid 82953 | pid 64484 (was 35348) |
+| --- | --- | --- |
+| port | **3100** | **3101** |
+| started | 00:50:24 | reloaded by `tsx watch` on every source change |
+| parent | `1` — orphaned, never reloads | the `dev-runner.ts watch` supervisor |
+| AND-73 guard (landed 12:41) | **absent** | present |
+| AND-69 `serverInfo.freshness` (landed 11:13) | **absent** from `/api/health` | `status: "current"` |
+
+`PAPERCLIP_API_URL` for the CTO is `http://backlit.local:3100` — the orphaned
+process. The Chief of Staff's closes reached 3101. Same issues, same database,
+same board; two code vintages, decided by which port the agent was handed.
+
+Verified by A/B on one throwaway issue, reopened and re-closed against each
+port seconds apart with an identical working tree:
+
+- `PATCH :3101 {status: done}` → `pushStateProbe: { kind: "clean", branch:
+  "platform/run-lifecycle-stability", remoteRef: "fork/platform/run-lifecycle-stability" }`
+- `PATCH :3100 {status: done}` → no `pushStateProbe`, no `pushStateWarning`, no
+  activity row. The guard is not in that binary.
+
+Two corollaries worth keeping:
+
+- **`/api/health`'s top-level `commit` is not evidence about the running
+  process.** It is read live from the checkout — deliberately, per
+  `server-info.ts` — so pid 82953 reports `1310dfe43` while running code from
+  fourteen hours earlier. The field that *does* answer the question is
+  `serverInfo.freshness` (AND-69), and its **absence** from a `/api/health`
+  response is itself the tell: a process old enough to lack the drift reporter
+  cannot report its own drift.
+- **The 18:25:38 close was additionally a push race**, independent of the above.
+  The fork reflog shows `refs/remotes/fork/platform/run-lifecycle-stability`
+  updated to `eae373d0e` at 14:25:40 -0400, a second *after* that close began.
+  A `clean` probe there would have been correct.
+
+Ruled out along the way, and worth not re-testing: the post-update issue object
+does **not** drop a `projectId` set by an earlier PATCH. `svc.update` returns
+the full updated row, and the route test `"still resolves the repo when
+projectId was set by an earlier PATCH"` pins that.
+
+The residual is operational, not code: an orphaned server process serving stale
+code on the port agents are pointed at. Nothing in the control plane detects or
+refuses that today.

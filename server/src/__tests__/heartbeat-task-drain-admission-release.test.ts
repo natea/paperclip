@@ -220,28 +220,36 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
   }, 20_000);
 
   // Wraps db.transaction so the callback's tx object throws the moment code
-  // calls tx.update(table) for a table named in tablesByCall — this makes a
-  // real Postgres transaction roll back exactly like a genuine write failure
-  // partway through, without touching any other table's update path.
-  // tablesByCall maps a 0-based db.transaction() call index (in call order)
-  // to the table that call should fail on; a call index with no entry runs
-  // every update for real. For example { 0: issues } fails only the
-  // issue-lock write inside releaseRunClaimedJustBeforeSuppression's
-  // transaction.
-  function withFailingTransactionalUpdate(realDb: typeof db, tablesByCall: Record<number, unknown>) {
-    let callIndex = 0;
+  // calls tx.update(fault.table) inside a transaction that has already called
+  // tx.update(fault.after) — this makes a real Postgres transaction roll back
+  // exactly like a genuine write failure partway through, without touching any
+  // other transaction's update path.
+  //
+  // The target is addressed by what the transaction *writes*, deliberately not
+  // by which db.transaction() call it happens to be. An earlier version keyed
+  // the fault on a 0-based db.transaction() call index, which silently stopped
+  // injecting anything the moment AND-41 wrapped the admission path in
+  // `withAgentStartDbLock` — a pg_advisory_xact_lock transaction that issues no
+  // update at all, but still consumed call index 0. The test then asserted a
+  // failure-mode outcome against a release that had in fact succeeded. Any
+  // ordinal-addressed fault injection has that failure mode; write-signature
+  // addressing does not.
+  function withFailingTransactionalUpdate(
+    realDb: typeof db,
+    fault: { table: unknown; after: unknown },
+  ) {
     return new Proxy(realDb, {
       get(target, prop, receiver) {
         if (prop !== "transaction") return Reflect.get(target, prop, receiver);
-        return (fn: (tx: unknown) => Promise<unknown>) => {
-          const failingTable = tablesByCall[callIndex];
-          callIndex += 1;
-          return target.transaction((tx) => {
+        return (fn: (tx: unknown) => Promise<unknown>) =>
+          target.transaction((tx) => {
+            let sawPrecedingWrite = false;
             const txProxy = new Proxy(tx as object, {
               get(txTarget, txProp, txReceiver) {
                 if (txProp === "update") {
                   return (table: unknown) => {
-                    if (failingTable !== undefined && table === failingTable) {
+                    if (table === fault.after) sawPrecedingWrite = true;
+                    if (sawPrecedingWrite && table === fault.table) {
                       throw new Error("simulated transactional write failure");
                     }
                     return (txTarget as any).update(table);
@@ -252,7 +260,6 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
             });
             return fn(txProxy);
           });
-        };
       },
     }) as typeof db;
   }
@@ -262,7 +269,11 @@ describeEmbeddedPostgres("heartbeat task-drain admission release", () => {
     // Fault the release transaction on the issue-lock write, so executeRun's
     // suppression branch catches the failure, logs it, and returns instead
     // of throwing. There is no in-process fallback or retry for this path.
-    const failingDb = withFailingTransactionalUpdate(db, { 0: issues });
+    // releaseRunClaimedJustBeforeSuppression's transaction writes heartbeatRuns,
+    // then agentWakeupRequests, then the issue lock. Faulting the issue write in
+    // the transaction that has already written heartbeatRuns names that release
+    // uniquely, whatever else opens a transaction ahead of it.
+    const failingDb = withFailingTransactionalUpdate(db, { table: issues, after: heartbeatRuns });
     const heartbeat = heartbeatService(failingDb);
 
     const unsubscribe = subscribeCompanyLiveEvents(companyId, (event) => {

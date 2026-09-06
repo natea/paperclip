@@ -26,6 +26,23 @@ export function resolveServerDevWatchIgnorePaths(serverRoot: string): string[] {
   const ignorePaths = new Set<string>([
     "**/{node_modules,bower_components,vendor}/**",
     "**/.vite-temp/**",
+    // Test sources are never in the running server's module graph, so a test
+    // edit can only ever cost a restart. That restart is not free: shutdown
+    // SIGTERMs every in-flight agent run, so an agent iterating on a server
+    // test kills its own run (and every other agent's) on each save. Excluding
+    // them removes the largest source of self-inflicted restart churn.
+    //
+    // AND-18: a *non*-test source edit still costs a restart, but no longer
+    // costs the runs. `drainRunningRunsForShutdown` recognises a dev-watch
+    // SIGTERM (via PAPERCLIP_DEV_WATCH, set in server/scripts/dev-watch.ts)
+    // and leaves detached, group-leading agent processes alive for the next
+    // boot to adopt. This exclusion list is now a restart-cost optimisation,
+    // not the only thing standing between an agent and its own run.
+    "**/__tests__/**",
+    "**/*.test.ts",
+    "**/*.test.tsx",
+    "**/*.test.mts",
+    "**/*.test.js",
   ]);
 
   for (const relativePath of [

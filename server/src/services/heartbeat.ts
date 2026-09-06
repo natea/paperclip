@@ -341,6 +341,7 @@ import {
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
+import { hasPendingWakeInteraction } from "./recovery/pending-wake-interaction.js";
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
@@ -364,7 +365,7 @@ import {
 import { productivityReviewService } from "./productivity-review.js";
 import { resolveRequiredSuccessfulRunHandoffOnValidPath } from "./successful-run-handoff-state.js";
 import { taskWatchdogService } from "./task-watchdogs.js";
-import { withAgentStartLock } from "./agent-start-lock.js";
+import { withAgentStartDbLock, withAgentStartLock } from "./agent-start-lock.js";
 import {
   evaluateAgentInvokability,
   evaluateAgentInvokabilityFromDb,
@@ -388,6 +389,8 @@ import {
   hasSessionCompactionThresholds,
   resolvePaperclipRunnerIdleTimeoutMs,
   resolveSessionCompactionPolicy,
+  type RunExecutionEngine,
+  type RunProcessTopology,
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
@@ -427,6 +430,7 @@ import {
   type HotRestartIntentRun,
   type HotRestartReportRun,
 } from "./hot-restart.js";
+import { isPidOwnedByRecordedStart } from "./process-liveness.js";
 import {
   assertLowTrustRuntimeServicesAllowed,
   assertLowTrustWorkspaceIsolation,
@@ -7646,29 +7650,46 @@ export function buildPaperclipTaskMarkdown(input: {
   return lines.join("\n");
 }
 
-// A positive liveness check means some process currently owns the PID.
-// On Linux, PIDs can be recycled, so this is a best-effort signal rather
-// than proof that the original child is still alive.
-function isProcessAlive(pid: number | null | undefined) {
+// A positive signal-0 probe means some process currently owns the PID -- not
+// that it is the child we spawned, because PIDs are recycled across a reboot or
+// a wraparound. When the spawn site recorded a start time we compare it against
+// the start time the OS reports for the PID, which turns "some process holds
+// this number" into "our process is still alive". Callers that have no recorded
+// start time keep the old best-effort behaviour; see process-liveness.ts.
+async function isProcessAlive(
+  pid: number | null | undefined,
+  recordedStartedAt?: Date | string | null,
+) {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0)
     return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === "EPERM") return true;
-    if (code === "ESRCH") return false;
-    return false;
+    if (code !== "EPERM") return false;
   }
+  return isPidOwnedByRecordedStart({ pid, recordedStartedAt });
 }
 
 export async function persistHeartbeatRunProcessMetadata(
   db: Db,
   runId: string,
-  meta: { pid: number; processGroupId: number | null; startedAt: string },
+  meta: {
+    pid: number;
+    processGroupId: number | null;
+    startedAt: string;
+    executionEngine?: RunExecutionEngine;
+    processTopology?: RunProcessTopology;
+  },
 ) {
   const startedAt = new Date(meta.startedAt);
+  // The spawn site knows which lane it selected; record it as a fact on the run
+  // so restart handling reads it back instead of re-deriving the lane from
+  // adapter config that does not determine it. Adapters that do not report a
+  // lane leave the keys absent, and readers fall back to the observed shape.
+  const lane: Record<string, string> = {};
+  if (meta.executionEngine) lane.executionEngine = meta.executionEngine;
+  if (meta.processTopology) lane.processTopology = meta.processTopology;
   return db
     .update(heartbeatRuns)
     .set({
@@ -7677,6 +7698,13 @@ export async function persistHeartbeatRunProcessMetadata(
       processStartedAt: Number.isNaN(startedAt.getTime())
         ? new Date()
         : startedAt,
+      // Merge, never replace: contextSnapshot carries unrelated keys (issueId,
+      // wake provenance) written by other paths on this same row.
+      ...(Object.keys(lane).length > 0
+        ? {
+            contextSnapshot: sql`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object' then ${heartbeatRuns.contextSnapshot} else '{}'::jsonb end || ${JSON.stringify(lane)}::jsonb`,
+          }
+        : {}),
       updatedAt: new Date(),
     })
     .where(eq(heartbeatRuns.id, runId))
@@ -11640,7 +11668,13 @@ export function heartbeatService(
 
   async function persistRunProcessMetadata(
     runId: string,
-    meta: { pid: number; processGroupId: number | null; startedAt: string },
+    meta: {
+      pid: number;
+      processGroupId: number | null;
+      startedAt: string;
+      executionEngine?: RunExecutionEngine;
+      processTopology?: RunProcessTopology;
+    },
   ) {
     return persistHeartbeatRunProcessMetadata(db, runId, meta);
   }
@@ -12375,6 +12409,22 @@ export function heartbeatService(
     ) {
       return false;
     }
+    // No lane recorded on the run. Either this row predates the spawn sites
+    // recording one, or it came from a path that does not spawn a local
+    // process. Prefer the observed process shape over adapter config: a run
+    // whose pid is its own process-group leader was spawned detached and
+    // outlives this server. That is the same signal AND-18's dev-watch
+    // preservation gate keys on, so both restart paths now agree on which runs
+    // survive a restart.
+    const processPid = input.run.processPid ?? null;
+    const processGroupId = input.run.processGroupId ?? null;
+    if (
+      processPid !== null &&
+      processGroupId !== null &&
+      processPid === processGroupId
+    ) {
+      return false;
+    }
     if (
       !["claude_local", "codex_local", "gemini_local"].includes(
         input.adapterType,
@@ -12382,6 +12432,11 @@ export function heartbeatService(
     ) {
       return false;
     }
+    // Last resort for a legacy row with no recorded lane and no usable process
+    // group. `engine` does not determine the lane, so an unset value is
+    // unknown, not "acp" -- and draining a run that could have been adopted
+    // only costs an optimisation, while adopting a server-bound run loses it.
+    // Stay conservative here rather than flipping the default.
     return (
       readNonEmptyString(parseObject(input.adapterConfig).engine) !== "cli"
     );
@@ -12689,7 +12744,10 @@ export function heartbeatService(
 
       const processPid = run.processPid ?? candidate.processPid;
       const processGroupId = run.processGroupId ?? candidate.processGroupId;
-      const processPidAlive = isProcessAlive(processPid);
+      const processPidAlive = await isProcessAlive(
+        processPid,
+        run.processStartedAt,
+      );
       const processGroupAlive = isProcessGroupAlive(processGroupId);
       if (!processPid && !processGroupId) {
         classify(candidate, "lost", "missing_process_metadata", patch);
@@ -12822,7 +12880,12 @@ export function heartbeatService(
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
-      return { interrupted: 0, interruptedRunIds: [], retryRunIds: [] };
+      return {
+        interrupted: 0,
+        interruptedRunIds: [],
+        retryRunIds: [],
+        preservedRunIds: [],
+      };
     }
     const activeRuns = await db
       .select({
@@ -12842,8 +12905,48 @@ export function heartbeatService(
 
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
+    const preservedRunIds: string[] = [];
+    // Under `tsx watch` (server/scripts/dev-watch.ts) a SIGTERM is a restart,
+    // not a stop: every save to server/src restarts the server, and draining
+    // would SIGTERM every in-flight agent run on the instance -- including the
+    // run of the agent doing the editing. An operator stop still arrives as
+    // SIGINT on the foreground process group, so gate this on SIGTERM only.
+    const preserveDetachedRunsForDevRestart =
+      signal === "SIGTERM" && process.env.PAPERCLIP_DEV_WATCH === "1";
 
     for (const { run, agent } of activeRuns) {
+      // Only child processes that lead their own process group survive a
+      // restart; anything sharing the server's group dies with it anyway, so
+      // preserving it in the database would strand a `running` row. Boot
+      // reconciliation picks these up: a live pid keeps the run `running` with
+      // errorCode `process_detached` instead of failing or retrying it.
+      if (
+        preserveDetachedRunsForDevRestart &&
+        run.runtimeMode !== "native" &&
+        run.processPid !== null &&
+        run.processGroupId !== null &&
+        run.processPid === run.processGroupId &&
+        (await isProcessAlive(run.processPid, run.processStartedAt))
+      ) {
+        runningProcesses.delete(run.id);
+        preservedRunIds.push(run.id);
+        await appendRunEvent(run, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message:
+            `Left running across a dev-watch server restart (${signal}); `
+            + "the agent process was not signalled",
+          payload: {
+            signal,
+            processPid: run.processPid,
+            processGroupId: run.processGroupId,
+            devWatchRestart: true,
+          },
+        });
+        continue;
+      }
+
       const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
       const running = runningProcesses.get(run.id);
       try {
@@ -12934,6 +13037,13 @@ export function heartbeatService(
       interruptedRunIds.push(interrupted.id);
     }
 
+    if (preservedRunIds.length > 0) {
+      logger.warn(
+        { signal, preserved: preservedRunIds.length, preservedRunIds },
+        "left detached agent runs alive across a dev-watch server restart",
+      );
+    }
+
     if (interruptedRunIds.length > 0) {
       logger.warn(
         {
@@ -12950,6 +13060,7 @@ export function heartbeatService(
       interrupted: interruptedRunIds.length,
       interruptedRunIds,
       retryRunIds,
+      preservedRunIds,
     };
   }
 
@@ -15870,6 +15981,166 @@ export function heartbeatService(
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /**
+   * The agent-reachable recovery route for an agent stuck in `error`, kept in
+   * one place so the escalation issue, the docs, and the API agree. See
+   * `docs/guides/board-operator/managing-agents.md` (AND-43).
+   */
+  function agentErrorRecoveryInstructions(agent: {
+    id: string;
+    name: string;
+  }) {
+    return [
+      `1. Read the failing run before clearing anything: \`GET /api/agents/${agent.id}/runs\` and the run log for the newest \`failed\` run.`,
+      `2. If the failure was infrastructure (a teardown kill, a lost process, a restart) rather than the agent's work, recover it: \`POST /api/agents/${agent.id}/clear-error\`, or \`POST /api/agents/${agent.id}/resume\` -- both return the agent to \`idle\` and clear \`errorReason\`. A manager with change-grant authority over its own report may call either; the board may always call either.`,
+      `3. If the failure is real, fix the cause first and file the fix as its own issue -- clearing the error only makes ${agent.name} heartbeat again, it does not fix anything.`,
+      `4. Close this issue once ${agent.name} has left \`error\` and taken a heartbeat.`,
+    ].join("\n");
+  }
+
+  function buildAgentErrorEscalationBody(input: {
+    agent: { id: string; name: string; role: string | null };
+    failureReason: string | null;
+    lastRun: { id: string; errorCode: string | null; finishedAt: Date | null } | null;
+    manager: { id: string; name: string } | null;
+  }) {
+    const { agent, lastRun } = input;
+    return [
+      `\`${agent.name}\`${agent.role ? ` (${agent.role})` : ""} entered \`status: error\` and has stopped heartbeating. Every issue assigned to it is stalled until it is recovered.`,
+      "",
+      "| field | value |",
+      "|---|---|",
+      `| agent | \`${agent.name}\` (\`${agent.id}\`) |`,
+      `| errorReason | ${input.failureReason ? `\`${input.failureReason}\`` : "_none recorded_"} |`,
+      `| last run | ${lastRun ? `\`${lastRun.id}\`` : "_unknown_"} |`,
+      `| errorCode | ${lastRun?.errorCode ? `\`${lastRun.errorCode}\`` : "_none_"} |`,
+      `| stopped at | ${lastRun?.finishedAt ? lastRun.finishedAt.toISOString() : "_unknown_"} |`,
+      "",
+      "## Recovery",
+      "",
+      agentErrorRecoveryInstructions(agent),
+      "",
+      input.manager
+        ? `Owner: \`${input.manager.name}\`, this agent's manager.`
+        : "This agent has no manager, so recovery is the board's: the issue is filed unassigned deliberately.",
+    ].join("\n");
+  }
+
+  async function findOpenAgentErrorEscalation(agent: {
+    id: string;
+    companyId: string;
+  }) {
+    return db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, agent.companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.agentErrorEscalation),
+          eq(issues.originId, agent.id),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Make an agent falling into `error` observable. Before AND-43 this
+   * transition was silent: the agent stopped heartbeating, every issue behind
+   * it stalled, and the only way to notice was for a human to list agents. File
+   * it against the agent's manager (unassigned when it has none, which routes
+   * it to the board) and wake the manager so somebody owns the recovery.
+   */
+  async function escalateAgentError(input: {
+    agent: typeof agents.$inferSelect;
+    failureReason: string | null;
+  }) {
+    const { agent } = input;
+    const existingEscalation = await findOpenAgentErrorEscalation(agent);
+    if (existingEscalation) return existingEscalation;
+
+    const lastRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        errorCode: heartbeatRuns.errorCode,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agent.id),
+          eq(heartbeatRuns.status, "failed"),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.startedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const manager = agent.reportsTo ? await getAgent(agent.reportsTo) : null;
+
+    const escalation = await issuesSvc.create(agent.companyId, {
+      title: `${agent.name} stopped in error and needs recovery`,
+      description: buildAgentErrorEscalationBody({
+        agent: { id: agent.id, name: agent.name, role: agent.role },
+        failureReason: input.failureReason,
+        lastRun,
+        manager: manager ? { id: manager.id, name: manager.name } : null,
+      }),
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: manager?.id ?? null,
+      originKind: RECOVERY_ORIGIN_KINDS.agentErrorEscalation,
+      originId: agent.id,
+      originFingerprint: `agent_error:${agent.id}`,
+    });
+
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: "agent.error_escalated",
+      entityType: "agent",
+      entityId: agent.id,
+      agentId: manager?.id ?? null,
+      details: {
+        escalationIssueId: escalation.id,
+        errorReason: input.failureReason ?? null,
+        lastRunId: lastRun?.id ?? null,
+        lastRunErrorCode: lastRun?.errorCode ?? null,
+        managerAgentId: manager?.id ?? null,
+      },
+    });
+
+    if (manager?.id) {
+      await enqueueWakeup(manager.id, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        idempotencyKey: `agent-error-escalation:${escalation.id}`,
+        payload: withRecoveryContext(
+          { issueId: escalation.id, erroredAgentId: agent.id },
+          "status_only",
+        ),
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat",
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: escalation.id,
+            taskId: escalation.id,
+            wakeReason: "issue_assigned",
+            source: RECOVERY_ORIGIN_KINDS.agentErrorEscalation,
+            erroredAgentId: agent.id,
+          },
+          "status_only",
+        ),
+      });
+    }
+
+    return escalation;
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -15937,6 +16208,26 @@ export function heartbeatService(
           outcome,
         },
       });
+    }
+
+    // AND-43: an agent entering `error` stops heartbeating and stalls every
+    // issue behind it, so the transition -- not the steady state -- is what has
+    // to raise an owner. Only escalate on the edge into `error`; an agent
+    // already there has an open escalation.
+    if (updated && updated.status === "error" && existing.status !== "error") {
+      try {
+        await escalateAgentError({
+          agent: updated,
+          failureReason: truncateAgentErrorReason(failureReason),
+        });
+      } catch (error) {
+        // A failed escalation must not swallow the status write that just
+        // landed: the agent is still correctly in `error` either way.
+        logger.error(
+          { error, agentId: updated.id },
+          "failed to escalate agent error to a manager",
+        );
+      }
     }
   }
 
@@ -16562,7 +16853,8 @@ export function heartbeatService(
         continue;
       }
       const processPidAlive =
-        !!run.processPid && isProcessAlive(run.processPid);
+        !!run.processPid &&
+        (await isProcessAlive(run.processPid, run.processStartedAt));
       const processGroupAlive =
         !!run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive || processGroupAlive) {
@@ -16751,7 +17043,9 @@ export function heartbeatService(
     } of activeRuns) {
       const nativeRun = run.runtimeMode === "native";
       const nativeProcessPidAlive =
-        nativeRun && !!run.processPid && isProcessAlive(run.processPid);
+        nativeRun &&
+        !!run.processPid &&
+        (await isProcessAlive(run.processPid, run.processStartedAt));
       const nativeProcessGroupAlive =
         nativeRun &&
         !!run.processGroupId &&
@@ -16808,8 +17102,8 @@ export function heartbeatService(
         currentAdapterTracksLocalChild || run.runtimeMode === "native";
       const processPidAlive =
         checksPersistedChildLiveness &&
-        run.processPid &&
-        isProcessAlive(run.processPid);
+        !!run.processPid &&
+        (await isProcessAlive(run.processPid, run.processStartedAt));
       const processGroupAlive =
         checksPersistedChildLiveness &&
         run.processGroupId &&
@@ -17085,6 +17379,14 @@ export function heartbeatService(
     return recovery.reconcileResolvedDependencyWakeBackstop(opts);
   }
 
+  async function reconcileIssueGraphLivenessEscalations(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    minIntervalMs?: number;
+  }) {
+    return recovery.reconcileIssueGraphLivenessEscalations(opts);
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -17175,105 +17477,110 @@ export function heartbeatService(
         return [];
       }
       const policy = parseHeartbeatPolicy(agent);
-      const runningCount = await countRunningRunsForAgent(agentId);
-      const availableSlots = Math.max(
-        0,
-        policy.maxConcurrentRuns - runningCount,
-      );
-      if (availableSlots <= 0) return [];
+      const claimedRuns = await withAgentStartDbLock<
+        Array<typeof heartbeatRuns.$inferSelect>
+      >(db, agentId, async () => {
+        const runningCount = await countRunningRunsForAgent(agentId);
+        const availableSlots = Math.max(
+          0,
+          policy.maxConcurrentRuns - runningCount,
+        );
+        if (availableSlots <= 0) return [];
 
-      const queuedRuns = await db
-        .select()
-        .from(heartbeatRuns)
-        .where(
-          and(
-            eq(heartbeatRuns.agentId, agentId),
-            eq(heartbeatRuns.status, "queued"),
-            cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-          ),
-        )
-        .orderBy(asc(heartbeatRuns.createdAt));
-      if (queuedRuns.length === 0) return [];
+        const queuedRuns = await db
+          .select()
+          .from(heartbeatRuns)
+          .where(
+            and(
+              eq(heartbeatRuns.agentId, agentId),
+              eq(heartbeatRuns.status, "queued"),
+              cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+            ),
+          )
+          .orderBy(asc(heartbeatRuns.createdAt));
+        if (queuedRuns.length === 0) return [];
 
-      const dependencyReadiness = await listQueuedRunDependencyReadiness(
-        agent.companyId,
-        queuedRuns,
-      );
-      const queuedIssueIds = [
-        ...new Set(
-          queuedRuns
-            .map((run) =>
-              readNonEmptyString(parseObject(run.contextSnapshot).issueId),
-            )
-            .filter((issueId): issueId is string => Boolean(issueId)),
-        ),
-      ];
-      const issueRows = await db
-        .select({
-          id: issues.id,
-          status: issues.status,
-          priority: issues.priority,
-        })
-        .from(issues)
-        .where(
-          queuedIssueIds.length > 0
-            ? and(
-                eq(issues.companyId, agent.companyId),
-                inArray(issues.id, queuedIssueIds),
+        const dependencyReadiness = await listQueuedRunDependencyReadiness(
+          agent.companyId,
+          queuedRuns,
+        );
+        const queuedIssueIds = [
+          ...new Set(
+            queuedRuns
+              .map((run) =>
+                readNonEmptyString(parseObject(run.contextSnapshot).issueId),
               )
-            : sql`false`,
-        );
-      const issueById = new Map(issueRows.map((row) => [row.id, row]));
-      const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
-      const prioritizedRuns = [...queuedRuns].sort((left, right) => {
-        const leftIssueId = readNonEmptyString(
-          parseObject(left.contextSnapshot).issueId,
-        );
-        const rightIssueId = readNonEmptyString(
-          parseObject(right.contextSnapshot).issueId,
-        );
-        const leftReadiness = leftIssueId
-          ? dependencyReadiness.get(leftIssueId)
-          : null;
-        const rightReadiness = rightIssueId
-          ? dependencyReadiness.get(rightIssueId)
-          : null;
-        const leftReady = leftIssueId
-          ? (leftReadiness?.isDependencyReady ?? true)
-          : true;
-        const rightReady = rightIssueId
-          ? (rightReadiness?.isDependencyReady ?? true)
-          : true;
-        const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
-        const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
-        const leftRank = leftIssueId
-          ? leftReady
-            ? leftIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        const rightRank = rightIssueId
-          ? rightReady
-            ? rightIssue?.status === "in_progress"
-              ? 0
-              : 1
-            : 3
-          : 2;
-        if (leftRank !== rightRank) return leftRank - rightRank;
-        const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
-        const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
-        if (leftPriorityRank !== rightPriorityRank)
-          return leftPriorityRank - rightPriorityRank;
-        return left.createdAt.getTime() - right.createdAt.getTime();
-      });
+              .filter((issueId): issueId is string => Boolean(issueId)),
+          ),
+        ];
+        const issueRows = await db
+          .select({
+            id: issues.id,
+            status: issues.status,
+            priority: issues.priority,
+          })
+          .from(issues)
+          .where(
+            queuedIssueIds.length > 0
+              ? and(
+                  eq(issues.companyId, agent.companyId),
+                  inArray(issues.id, queuedIssueIds),
+                )
+              : sql`false`,
+          );
+        const issueById = new Map(issueRows.map((row) => [row.id, row]));
+        const companyAgents = await listCompanyAgentOrgRows(agent.companyId);
+        const prioritizedRuns = [...queuedRuns].sort((left, right) => {
+          const leftIssueId = readNonEmptyString(
+            parseObject(left.contextSnapshot).issueId,
+          );
+          const rightIssueId = readNonEmptyString(
+            parseObject(right.contextSnapshot).issueId,
+          );
+          const leftReadiness = leftIssueId
+            ? dependencyReadiness.get(leftIssueId)
+            : null;
+          const rightReadiness = rightIssueId
+            ? dependencyReadiness.get(rightIssueId)
+            : null;
+          const leftReady = leftIssueId
+            ? (leftReadiness?.isDependencyReady ?? true)
+            : true;
+          const rightReady = rightIssueId
+            ? (rightReadiness?.isDependencyReady ?? true)
+            : true;
+          const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
+          const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
+          const leftRank = leftIssueId
+            ? leftReady
+              ? leftIssue?.status === "in_progress"
+                ? 0
+                : 1
+              : 3
+            : 2;
+          const rightRank = rightIssueId
+            ? rightReady
+              ? rightIssue?.status === "in_progress"
+                ? 0
+                : 1
+              : 3
+            : 2;
+          if (leftRank !== rightRank) return leftRank - rightRank;
+          const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
+          const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
+          if (leftPriorityRank !== rightPriorityRank)
+            return leftPriorityRank - rightPriorityRank;
+          return left.createdAt.getTime() - right.createdAt.getTime();
+        });
 
-      const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
-        if (claimed) claimedRuns.push(claimed);
-      }
+        const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
+        for (const queuedRun of prioritizedRuns) {
+          if (claimedRuns.length >= availableSlots) break;
+          const claimed = await claimQueuedRun(queuedRun, companyAgents);
+          if (claimed) claimedRuns.push(claimed);
+        }
+        return claimedRuns;
+      });
       if (claimedRuns.length === 0) return [];
 
       for (const claimedRun of claimedRuns) {
@@ -17429,12 +17736,15 @@ export function heartbeatService(
         tracked.child.signalCode === null;
       const trackedPid = tracked?.child.pid ?? null;
       const trackedProcessGroupId = tracked?.processGroupId ?? null;
-      const trackedPidAlive = trackedPid ? isProcessAlive(trackedPid) : false;
+      const trackedPidAlive = trackedPid
+        ? await isProcessAlive(trackedPid)
+        : false;
       const trackedProcessGroupAlive = trackedProcessGroupId
         ? isProcessGroupAlive(trackedProcessGroupId)
         : false;
       const persistedPidAlive =
-        !!run.processPid && isProcessAlive(run.processPid);
+        !!run.processPid &&
+        (await isProcessAlive(run.processPid, run.processStartedAt));
       const persistedProcessGroupAlive =
         !!run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (
@@ -19559,9 +19869,15 @@ export function heartbeatService(
 
         // Pause Durability: flip to "running" ONLY if the agent is still invokable.
         // Atomic conditional UPDATE is the sole gate (no read-then-write); 0 rows => abort.
+        //
+        // AND-47: `error` is invokable, so a process-loss retry legitimately
+        // starts here with the failed run's `errorReason` still on the row.
+        // Leaving it behind advertises a dead failure on a running agent --
+        // and `clear-error` used to refuse to scrub it. The agent is executing;
+        // the reason belongs to the run that failed, not to this one.
         const runningAgent = await db
           .update(agents)
-          .set({ status: "running", updatedAt: new Date() })
+          .set({ status: "running", errorReason: null, updatedAt: new Date() })
           .where(
             and(
               eq(agents.id, agent.id),
@@ -20844,6 +21160,14 @@ export function heartbeatService(
                             ? meta.processGroupId
                             : null,
                         startedAt: meta.startedAt,
+                        executionEngine:
+                          "executionEngine" in meta
+                            ? meta.executionEngine
+                            : undefined,
+                        processTopology:
+                          "processTopology" in meta
+                            ? meta.processTopology
+                            : undefined,
                       });
                     },
                     authToken: authToken ?? undefined,
@@ -21058,6 +21382,16 @@ export function heartbeatService(
           (adapterResult.exitCode ?? 0) === 0 &&
           !adapterResult.errorMessage
         ) {
+          outcome = "succeeded";
+        } else if (
+          adapterResult.providerTerminalSuccess &&
+          !adapterResult.errorMessage
+        ) {
+          // The model emitted a clean terminal result and named no error; the
+          // nonzero exit came from tearing the process down afterwards (a CLI
+          // holding live background tasks has to be signalled, and the shell
+          // reports 143). Teardown of a finished run is not an adapter failure.
+          // See AND-43.
           outcome = "succeeded";
         } else {
           outcome = "failed";
@@ -22658,6 +22992,12 @@ export function heartbeatService(
           .then((rows) => rows[0] ?? null);
 
       const issueHasPersistedMonitor = Boolean(issue.monitorNextCheckAt);
+      // A pending board card with a wake continuation policy is a live
+      // execution path: answering (or rejecting) it wakes the assignee. The
+      // stranded-issue sweep already honours it, so immediate recovery must
+      // too, or a card that outlives a process restart demotes the issue.
+      const findPendingWakeInteractionPath = () =>
+        hasPendingWakeInteraction(tx, issue.companyId, issue.id);
       const findExplicitBlockerPath = () =>
         tx
           .select({ id: issueRelations.issueId })
@@ -22697,6 +23037,7 @@ export function heartbeatService(
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
           issueHasPersistedMonitor ||
+          (await findPendingWakeInteractionPath()) ||
           (await isAutomaticRecoverySuppressedByPauseHold(
             db,
             issue.companyId,
@@ -22837,6 +23178,7 @@ export function heartbeatService(
       if (
         existingExecutionPath ||
         issueHasPersistedMonitor ||
+        (await findPendingWakeInteractionPath()) ||
         (await findExplicitBlockerPath())
       ) {
         return { kind: "released" as const };
@@ -25586,6 +25928,7 @@ export function heartbeatService(
     sweepStaleIssueLocks,
 
     reconcileResolvedDependencyWakes,
+    reconcileIssueGraphLivenessEscalations,
 
     scanSilentActiveRuns,
 

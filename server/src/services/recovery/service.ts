@@ -29,6 +29,7 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
+import { classifyPidLiveness, type PidLiveness } from "../process-liveness.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
 import { logActivity } from "../activity-log.js";
@@ -36,7 +37,9 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { budgetService } from "../budgets.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
+import { hasPendingWakeInteraction as hasPendingWakeInteractionFor } from "./pending-wake-interaction.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import type { IssueLivenessFinding } from "../issue-liveness.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -86,6 +89,49 @@ const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiv
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
+
+/**
+ * Ceiling on recovery issues opened per company per tick. A graph that has gone badly wrong
+ * can produce dozens of critical findings at once; opening all of them in one tick would bury
+ * the board under exactly the noise this escalation exists to prevent. The remainder is not
+ * lost -- the findings are level-triggered, so the next tick picks up where this one stopped.
+ */
+const ISSUE_GRAPH_LIVENESS_ESCALATION_PER_COMPANY_LIMIT = 10;
+
+function issueGraphLivenessIssueLink(identifier: string | null, fallback: string) {
+  if (!identifier || !/^[A-Z][A-Z0-9]*-\d+$/.test(identifier)) return identifier ?? fallback;
+  return `[${identifier}](/${identifier.split("-")[0]}/issues/${identifier})`;
+}
+
+function buildIssueGraphLivenessEscalationDescription(finding: IssueLivenessFinding) {
+  const sourceLink = issueGraphLivenessIssueLink(finding.identifier, finding.issueId);
+  const path = finding.dependencyPath
+    .map((entry) => `- ${issueGraphLivenessIssueLink(entry.identifier, entry.issueId)} (${entry.status}) — ${entry.title}`)
+    .join("\n");
+  return [
+    `## Stranded issue: ${sourceLink}`,
+    "",
+    "Paperclip's issue-graph liveness classifier found this issue has no path that will ever",
+    "wake an agent, and raised it at `critical` severity. This recovery issue exists so the",
+    "finding schedules work instead of only appearing in the blocked inbox.",
+    "",
+    `- Finding: \`${finding.state}\``,
+    `- Reason: ${finding.reason}`,
+    "",
+    "### Dependency path",
+    "",
+    path || `- ${sourceLink}`,
+    "",
+    "### Next action",
+    "",
+    finding.recommendedAction,
+    "",
+    "Close this issue once the source issue has a real path again (an assignee that will wake,",
+    "a reviewer, an interaction, a monitor, or a deliberate `done`/`cancelled`). If the finding",
+    "is a false positive, say why in a comment and close this issue — the classifier is",
+    "level-triggered and will re-raise it if the shape is still there.",
+  ].join("\n");
+}
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX = "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -361,6 +407,22 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
 
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
+  // AND-17: a server restart (dev-watch reload or an operator stop) interrupts
+  // every in-flight run with this code. It describes the scheduler, not the
+  // issue, so it must retry with backoff like other transient infra. Without
+  // this entry it fell through to the `default` branch -- 1 attempt, no
+  // backoff -- and the next sweep demoted the issue to `blocked` with an empty
+  // `blockedBy`, which is what stranded AND-14 and AND-17 themselves.
+  "server_shutdown_interrupted",
+  // AND-17: the same restart also reaches a run through the adapter, as
+  // `process_signal_terminated` -- the OS killed the provider process (exit
+  // 143). Demoting the issue to `blocked` for it invents a blocker that has no
+  // `blockedBy` and no owner.
+  //
+  // `process_lost` deliberately stays out. It is the signal the stranded-recovery
+  // paths are built on ("live execution disappeared"), and reclassifying it as
+  // transient suppresses the escalation those paths owe the board.
+  "process_signal_terminated",
   "codex_transient_upstream",
   "codex_harness_crash",
   "claude_transient_upstream",
@@ -671,6 +733,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
+  let lastIssueGraphLivenessEscalationSweepAtMs: number | null = null;
 
   async function getAgent(agentId: string) {
     return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
@@ -822,21 +885,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Boolean(run || deferredWake);
   }
 
-  async function hasPendingWakeInteraction(companyId: string, issueId: string) {
-    return db
-      .select({ id: issueThreadInteractions.id })
-      .from(issueThreadInteractions)
-      .where(
-        and(
-          eq(issueThreadInteractions.companyId, companyId),
-          eq(issueThreadInteractions.issueId, issueId),
-          eq(issueThreadInteractions.status, "pending"),
-          inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
-        ),
-      )
-      .limit(1)
-      .then((rows) => Boolean(rows[0]));
-  }
+  const hasPendingWakeInteraction = (companyId: string, issueId: string) =>
+    hasPendingWakeInteractionFor(db, companyId, issueId);
 
   async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
     if (issue.monitorNextCheckAt) return true;
@@ -1487,6 +1537,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .update(agents)
       .set({
         status: nextStatus,
+        // AND-47: adoption is a transition out of `error` too. Clear the stale
+        // reason on the same write that moves the agent back to healthy,
+        // exactly as finalizeAgentStatus does; keep it when we land in `error`.
+        ...(nextStatus === "error" ? {} : { errorReason: null }),
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
@@ -4479,8 +4533,301 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+
+  /**
+   * AND-56: act on `critical` issue-graph liveness findings instead of only rendering them.
+   *
+   * Three tranches (the classifier, AND-51, AND-53) made detection good, but a finding only
+   * ever reached `listIssueBlockedInboxAttentionMap` -- a dashboard row. Clearing it required
+   * a human to open the blocked inbox. AND-52 sat `in_review` with a correct
+   * `in_review_without_action_path` finding for 51 minutes and was cleared only by accident.
+   *
+   * Mechanism: file a recovery issue assigned to the finding's recommended owner. Chosen over
+   * a direct assignee wake or a scheduled monitor because
+   *   - the read side for `harness_liveness_escalation` was already fully built and unused:
+   *     the incident key parses back to (source, leaf), the blocked inbox renders it as
+   *     `recovery_open`, and closing it cleans up its own blocks relation;
+   *   - it is durable. A queued wake can be dropped by a restart or throttled away
+   *     (`issue_graph_liveness_backstop` is in THROTTLED_ISSUE_REWAKE_REASONS); an issue row
+   *     survives, so the loop cannot silently reopen;
+   *   - idempotency is level-triggered rather than bookkept. `classifyIssueGraphLiveness`
+   *     already consumes `openRecoveryIssues` as a waiting path keyed on both the source and
+   *     leaf issue, so the finding stops being produced the moment the recovery issue exists.
+   *     Ten scheduler ticks over a persistent strand therefore produce one recovery issue.
+   *     The explicit originId lookup below is the belt to that suspenders, and covers the
+   *     window before the escalation is visible to the next snapshot.
+   *
+   * `warning` findings (an ordinary cold backlog item) stay dashboard-only on purpose.
+   */
+  async function reconcileIssueGraphLivenessEscalations(opts?: {
+    companyId?: string | null;
+    runId?: string | null;
+    /**
+     * Floor between sweeps. Classifying the full issue graph is not free, and the scheduler
+     * ticks every 30s; a strand that has already outlived a detector tranche does not need
+     * sub-minute latency. The periodic caller passes a few minutes, callers that want an
+     * immediate sweep (startup, tests) pass nothing.
+     */
+    minIntervalMs?: number;
+  }) {
+    const result = {
+      throttled: false,
+      companiesScanned: 0,
+      findings: 0,
+      criticalFindings: 0,
+      created: 0,
+      existingSkipped: 0,
+      ownerlessSkipped: 0,
+      pauseHoldSkipped: 0,
+      creationCapped: 0,
+      wakeQueued: 0,
+      failed: 0,
+      issueIds: [] as string[],
+      recoveryIssueIds: [] as string[],
+    };
+
+    const nowMs = Date.now();
+    const minIntervalMs = opts?.minIntervalMs ?? 0;
+    if (
+      minIntervalMs > 0 &&
+      lastIssueGraphLivenessEscalationSweepAtMs !== null &&
+      nowMs - lastIssueGraphLivenessEscalationSweepAtMs < minIntervalMs
+    ) {
+      result.throttled = true;
+      return result;
+    }
+    lastIssueGraphLivenessEscalationSweepAtMs = nowMs;
+
+    const companyRows = opts?.companyId
+      ? [{ id: opts.companyId }]
+      // A paused company is deliberately stopped. Opening recovery work there would fight the
+      // pause for exactly the reason the per-issue pause-hold guard below exists.
+      : await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
+    result.companiesScanned = companyRows.length;
+
+    for (const company of companyRows) {
+      let findings: IssueLivenessFinding[];
+      try {
+        findings = await issuesSvc.listIssueGraphLivenessFindings(company.id);
+      } catch (err) {
+        result.failed += 1;
+        logger.warn({ err, companyId: company.id }, "issue graph liveness escalation failed to classify company");
+        continue;
+      }
+      result.findings += findings.length;
+
+      const critical = findings.filter((finding) => finding.severity === "critical");
+      result.criticalFindings += critical.length;
+
+      let createdForCompany = 0;
+      for (const finding of critical) {
+        if (createdForCompany >= ISSUE_GRAPH_LIVENESS_ESCALATION_PER_COMPANY_LIMIT) {
+          result.creationCapped += 1;
+          continue;
+        }
+
+        // Guard the failure mode the issue calls out: a recovery action that itself has no
+        // wake path. `recommendedOwnerAgentId` is already filtered to an invokable in-company
+        // agent by the classifier's owner-candidate walk, so a null here means there is no
+        // agent that could own it and creating an unassigned issue would just add another
+        // stranded row.
+        const ownerAgentId = finding.recommendedOwnerAgentId;
+        if (!ownerAgentId) {
+          result.ownerlessSkipped += 1;
+          continue;
+        }
+
+        const existing = await db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, company.id),
+              eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+              eq(issues.originId, finding.incidentKey),
+              visibleIssueCondition(),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) {
+          result.existingSkipped += 1;
+          continue;
+        }
+
+        if (await isAutomaticRecoverySuppressedByPauseHold(db, company.id, finding.issueId, treeControlSvc)) {
+          result.pauseHoldSkipped += 1;
+          continue;
+        }
+
+        const sourceIssue = await db
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            identifier: issues.identifier,
+            title: issues.title,
+            projectId: issues.projectId,
+            goalId: issues.goalId,
+            billingCode: issues.billingCode,
+          })
+          .from(issues)
+          .where(and(eq(issues.companyId, company.id), eq(issues.id, finding.issueId)))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (!sourceIssue) {
+          result.failed += 1;
+          continue;
+        }
+
+        try {
+          const recoveryIssue = await issuesSvc.create(company.id, {
+            title: `Restore a live path for ${finding.identifier ?? sourceIssue.title}`,
+            description: buildIssueGraphLivenessEscalationDescription(finding),
+            // `todo` with an agent assignee and no user assignee is exactly the shape the
+            // classifier treats as eligible, so this recovery issue cannot itself become the
+            // next stranded finding.
+            status: "todo",
+            priority: "high",
+            projectId: sourceIssue.projectId,
+            goalId: sourceIssue.goalId,
+            assigneeAgentId: ownerAgentId,
+            assigneeUserId: null,
+            originKind: RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation,
+            originId: finding.incidentKey,
+            originFingerprint: `issue_graph_liveness:${finding.state}`,
+            billingCode: sourceIssue.billingCode,
+          });
+
+          createdForCompany += 1;
+          result.created += 1;
+          result.issueIds.push(finding.issueId);
+          result.recoveryIssueIds.push(recoveryIssue.id);
+
+          await logActivity(db, {
+            companyId: company.id,
+            actorType: "system",
+            actorId: "issue_graph_liveness_escalation",
+            agentId: ownerAgentId,
+            runId: opts?.runId ?? null,
+            action: "issue.liveness_escalation_issue_created",
+            entityType: "issue",
+            entityId: finding.issueId,
+            details: {
+              state: finding.state,
+              severity: finding.severity,
+              incidentKey: finding.incidentKey,
+              recoveryIssueId: recoveryIssue.id,
+              recoveryIdentifier: recoveryIssue.identifier,
+              leafIssueId: finding.recoveryIssueId,
+              ownerAgentId,
+              ownerReason: finding.recommendedOwnerCandidates[0]?.reason ?? null,
+            },
+          });
+
+          const wake = await deps.enqueueWakeup(ownerAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_liveness_escalation",
+            idempotencyKey: `issue-graph-liveness-escalation:${finding.incidentKey}`,
+            payload: withRecoveryContext(
+              { issueId: recoveryIssue.id, sourceIssueId: finding.issueId },
+              "normal_model",
+            ),
+            requestedByActorType: "system",
+            requestedByActorId: "issue_graph_liveness_escalation",
+            contextSnapshot: withRecoveryContext(
+              {
+                issueId: recoveryIssue.id,
+                taskId: recoveryIssue.id,
+                sourceIssueId: finding.issueId,
+                wakeReason: "issue_liveness_escalation",
+                source: "issue.graph_liveness_escalation",
+              },
+              "normal_model",
+            ),
+          });
+          // A null wake is a deferred/gated enqueue, not a failure: the recovery issue is
+          // assigned and non-terminal, so ordinary assignment dispatch still reaches it.
+          if (wake) result.wakeQueued += 1;
+        } catch (err) {
+          result.failed += 1;
+          logger.warn(
+            { err, companyId: company.id, issueId: finding.issueId, incidentKey: finding.incidentKey },
+            "failed to create issue graph liveness escalation issue",
+          );
+        }
+      }
+
+      if (result.creationCapped > 0) {
+        logger.warn(
+          {
+            companyId: company.id,
+            created: createdForCompany,
+            limit: ISSUE_GRAPH_LIVENESS_ESCALATION_PER_COMPANY_LIMIT,
+          },
+          "issue graph liveness escalation hit its per-company creation cap",
+        );
+      }
+    }
+
+    if (result.created > 0) {
+      logger.warn({ ...result }, "issue graph liveness escalation opened recovery issues for critical findings");
+    }
+
+    return result;
+  }
+
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
+  }
+
+  // Is the process that backed this run still alive?
+  //
+  // Three-valued on purpose. A plain signal-0 probe cannot tell "our child is
+  // still running" from "an unrelated process inherited this pid after a restart
+  // or a pid wraparound", and it answers "alive" to both. That false "alive" is
+  // permanent: the run never leaves "running", so a lock held on it never
+  // becomes cleanable. Comparing the recorded spawn timestamp against the start
+  // time the OS reports for the pid turns that case into proof of death.
+  //
+  // Fail-open: only a provable death returns "dead". Missing metadata, an
+  // unreadable OS start time, or a live process group we cannot attribute all
+  // return "unknown", and every caller must treat "unknown" as "leave it alone".
+  async function classifyRunProcessLiveness(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "processPid" | "processGroupId" | "processStartedAt"
+    >,
+  ): Promise<PidLiveness> {
+    const pid = run.processPid ?? null;
+    const processGroupId = run.processGroupId ?? null;
+    // No recorded process metadata: the run may simply not have stored its pid
+    // yet. Nothing to prove either way.
+    if (typeof pid !== "number" && typeof processGroupId !== "number") return "unknown";
+
+    const pidVerdict =
+      typeof pid === "number"
+        ? await classifyPidLiveness({
+            pid,
+            recordedStartedAt: run.processStartedAt,
+            isPidAlive,
+          })
+        : null;
+    if (pidVerdict === "alive") return "alive";
+
+    // The group id is usually the child's own pid, because the child leads its
+    // own group. Probing it then re-asks the same question about the same
+    // (possibly recycled) process, so it carries no independent evidence and the
+    // pid verdict stands alone. A group id that differs is a separate process
+    // group we cannot attribute by start time: if it answers, we cannot rule out
+    // that a surviving group member is ours, so the verdict degrades to unknown.
+    if (typeof processGroupId === "number" && processGroupId !== pid) {
+      if (isProcessGroupAlive(processGroupId)) return "unknown";
+      return pidVerdict === null || pidVerdict === "dead" ? "dead" : "unknown";
+    }
+
+    return pidVerdict === "dead" ? "dead" : "unknown";
   }
 
   // Backstop reconciler: terminalizes a "running" run that can no longer reach a
@@ -4551,17 +4898,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     // Process-death authority. The run is live only when a process still backs
-    // it. Check the in-memory handle first, then the recorded pid and process
-    // group. Require recorded process metadata, so this authority never fires on
-    // a run that has not yet stored its pid.
+    // it. Check the in-memory handle first, then the recorded process metadata.
+    // Only a "dead" verdict fires this authority: "unknown" leaves the run
+    // alone, exactly as a plain signal-0 hit did before the start-time
+    // comparison existed. Note that runReferencedByActiveIssue does not gate
+    // this authority — it scopes the issue-terminal authority above. A run whose
+    // process is provably gone is dead for its active issue too, and that is the
+    // case where the issue's lock most needs clearing.
     let processGone = false;
     if (!runningProcesses.get(run.id)) {
-      if (typeof pid === "number" || typeof processGroupId === "number") {
-        const processAlive =
-          (typeof pid === "number" && isPidAlive(pid)) ||
-          (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
-        processGone = !processAlive;
-      }
+      processGone = (await classifyRunProcessLiveness(run)) === "dead";
     }
 
     // A result-less native run may intentionally have no live provider process
@@ -4835,6 +5181,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
+    reconcileIssueGraphLivenessEscalations,
     readRecoveryTimerIntervalMs,
   };
 }

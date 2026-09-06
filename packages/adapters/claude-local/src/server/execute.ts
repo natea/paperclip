@@ -50,6 +50,8 @@ import {
   shapePaperclipWorkspaceEnvForExecution,
   stringifyPaperclipWakePayload,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
+  PROCESS_SIGNAL_TERMINATED_ERROR_CODE,
+  isProcessSignalTerminated,
 } from "@paperclipai/adapter-utils/server-utils";
 import { buildSkillLibraryManifestMarkdown } from "@paperclipai/adapter-utils/skill-library-manifest";
 import {
@@ -1002,6 +1004,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             loginUrl: loginMeta.loginUrl,
           }
         : undefined;
+    // The OS killed this process (server shutdown, dev-watch restart, operator
+    // cancel) rather than the provider failing on its own. The login and
+    // transient-upstream heuristics read truncated stdout+stderr and would
+    // mislabel the kill as a provider fault, so they are skipped below.
+    const signalTerminated = isProcessSignalTerminated(proc);
 
     if (proc.timedOut) {
       return {
@@ -1018,6 +1025,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (!parsed) {
       const fallbackErrorMessage = parseFallbackErrorMessage(proc);
       const providerQuota =
+        !signalTerminated &&
         !loginMeta.requiresLogin &&
         (proc.exitCode ?? 0) !== 0 &&
         isClaudeProviderQuotaError({
@@ -1027,6 +1035,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage: fallbackErrorMessage,
         });
       const transientUpstream =
+        !signalTerminated &&
         !loginMeta.requiresLogin &&
         !providerQuota &&
         (proc.exitCode ?? 0) !== 0 &&
@@ -1050,6 +1059,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         // surfaces the typed `duplex_channel_lost` code before any provider
         // classification, so the CLI lane and the ACP lane report it alike.
         ? proc.errorCode
+        : signalTerminated
+        ? PROCESS_SIGNAL_TERMINATED_ERROR_CODE
         : loginMeta.requiresLogin
         ? "claude_auth_required"
         : isClaudeModelNotFoundError({
@@ -1183,11 +1194,25 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    // The provider emitted a clean terminal result and then the runner killed
+    // the process itself, because a CLI still holding live background tasks
+    // never exits on its own. That kill is our own teardown of a finished run,
+    // not a provider or infrastructure fault, so it must not borrow the
+    // signal-termination disposition -- doing so marked successful runs
+    // `failed` / `Adapter failed` and tripped the agent into `error`.
+    const ownTerminalResultCleanupKill =
+      signalTerminated &&
+      parsedSucceeded &&
+      proc.terminalResultCleanup?.terminalResultSeen === true;
     const resolvedErrorCode = proc.errorCode
       // Forward the transport-level error code from the run-disposition seam
       // first. A lost duplex control channel surfaces the typed
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
+      : ownTerminalResultCleanupKill
+      ? null
+      : signalTerminated
+      ? PROCESS_SIGNAL_TERMINATED_ERROR_CODE
       : loginMeta.requiresLogin
       ? "claude_auth_required"
       : failed && isClaudeModelNotFoundError({
@@ -1233,6 +1258,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
+      // Carry the provider's own verdict alongside the raw exit code: the exit
+      // code stays truthful for diagnostics, and the server stops reading a
+      // post-success teardown as an adapter failure.
+      providerTerminalSuccess: parsedSucceeded,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,

@@ -67,6 +67,16 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
 
+### Writing from a timer wake (no `PAPERCLIP_TASK_ID`)
+
+A scheduler-driven heartbeat wakes with no task in its run context. That does **not** make it mute:
+
+- **Tasks you are the assignee of are always writable** — comment, PATCH, and resolve interactions on them directly, no checkout required. An assignee writing to its own task is not cross-issue influence.
+- **Checkout binds the run.** `POST /api/issues/{id}/checkout` writes the task into your run context, so every later write to it (and to any other task you check out in the same run) is attributed normally. Checkout is the remedy for a task you are *not* assigned.
+- **Do not check out a task just to comment on it.** Checkout moves the issue to `in_progress`, which destroys the state of anything legitimately parked in `in_review` behind a pending interaction or approval. Comment on it in place instead.
+- **Writes to tasks you neither own nor checked out are still refused** with `403 cross_issue_influence_run_not_task_bound`. Use the courier pattern (create an issue assigned to that agent) instead.
+- Unbound assignee writes are counted against the per-run cross-task cap (20). That is a fan-out backstop, not a permission decision; a normal heartbeat never approaches it.
+
 **Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
 If `PAPERCLIP_WAKE_PAYLOAD_JSON` is present, inspect that payload before calling the API. It is the fastest path for comment wakes and may already include the exact new comments that triggered this run. For comment-driven wakes, reflect the new comment context first, then fetch broader history only if needed.
@@ -260,7 +270,7 @@ Key shared semantics:
 - **Supersede on user comment.** Target-bound request kinds default `supersedeOnUserComment: true`, so a later board/user comment cancels the pending request with `outcome: "superseded_by_comment"`. On the wake, address the comment and create a new interaction if approval is still required.
 - **Withdraw and terminal expiry.** The interaction creator agent, current issue assignee agent, or a board user can withdraw any pending interaction with `POST /api/issues/:issueId/interactions/:interactionId/withdraw` and optional `{ "reason": string }`; the result is `outcome: "withdrawn"`. Closing an issue as `done` or `cancelled` expires all remaining pending interactions with `outcome: "issue_closed"` and never wakes the closed issue.
 - **Idempotency.** Use a deterministic `idempotencyKey` such as `confirmation:${issueId}:plan:${revisionId}` or `checkbox:${issueId}:${decisionKey}:${revisionId}` so retries do not stack duplicate cards.
-- **Source issue posture.** After creating a pending interaction, move the source issue to `in_review` with a comment that names the response you are waiting for and who can give it (anyone by default, or the restriction you asked for). When a `request_confirmation` or `request_checkbox_confirmation` is the issue review request, include its returned id as `reviewInteractionId` in that PATCH. This explicit binding lets policy-eligible agents submit the review verdict without granting the same authority to unrelated pending confirmations. The pending interaction is the explicit waiting path.
+- **Source issue posture.** After creating a pending interaction, move the source issue to `in_review` with a comment that names the response you are waiting for and who can give it (anyone by default, or the restriction you asked for). When a `request_confirmation` or `request_checkbox_confirmation` is the issue review request, include its returned id as `reviewInteractionId` in that PATCH. This explicit binding lets policy-eligible agents submit the review verdict without granting the same authority to unrelated pending confirmations. The binding is agent-scoped, not run-scoped: you can name a still-pending card your own agent opened in an earlier heartbeat, but naming another agent's card is refused with `422 invalid_review_interaction`. The pending interaction is the explicit waiting path.
 
 ### Standalone Decisions
 

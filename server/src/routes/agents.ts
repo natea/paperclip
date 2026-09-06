@@ -4753,11 +4753,22 @@ export function agentRoutes(
   });
 
   router.post("/agents/:id/clear-error", async (req, res) => {
-    assertBoard(req);
     const id = req.params.id as string;
     const existing = await getAccessibleAgent(req, res, id);
     if (!existing) {
       return;
+    }
+    // AND-43: recovering a report that fell into `error` is a manager's job,
+    // not only the board's. `clear-error` used to answer "Board access
+    // required" even to the CEO recovering a direct report, while `resume` --
+    // which lands the agent in exactly the same `idle`, `errorReason: null`
+    // state -- allowed it. An agent caller now gets the same change-grant check
+    // `resume` applies, so the obviously-named route and the working route are
+    // the same route. Human callers keep the board requirement they had.
+    if (req.actor.type === "agent") {
+      await assertCanResumeAgent(req, existing);
+    } else {
+      assertBoard(req);
     }
     if (existing.orgChainHealth?.status === "invalid_org_chain") {
       res.status(409).json({
@@ -4772,10 +4783,14 @@ export function agentRoutes(
       return;
     }
 
+    const clearActor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorType: clearActor.actorType,
+      actorId: clearActor.actorId,
+      agentId: clearActor.agentId,
+      runId: clearActor.runId,
+      agentApiKeyId: clearActor.agentApiKeyId,
       action: "agent.error_cleared",
       entityType: "agent",
       entityId: agent.id,

@@ -125,7 +125,8 @@ vi.mock("../services/instance-settings.js", () => ({
   instanceSettingsService: () => mockInstanceSettingsService,
 }));
 
-vi.mock("../services/issues.js", () => ({
+vi.mock("../services/issues.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/issues.js")>()),
   issueService: () => mockIssueService,
 }));
 

@@ -19,6 +19,7 @@ import type {
   AdapterRuntimeToolAccess,
   AdapterSkillEntry,
   AdapterSkillSnapshot,
+  RunProcessSpawnMeta,
 } from "./types.js";
 
 export function buildRuntimeToolsEnv(
@@ -58,6 +59,40 @@ export interface RunProcessResult {
   // duplex control channel died before a clean completion.
   errorCode?: string | null;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
+}
+
+/**
+ * The typed error code an adapter reports when the provider process was killed
+ * by a signal rather than failing on its own. A process-group SIGTERM (server
+ * shutdown, dev-watch restart, operator cancel) is an infrastructure event, not
+ * a provider or agent failure, and the two must not share a disposition: the
+ * provider heuristics run over the truncated stdout+stderr of a killed process
+ * and mislabel the kill as an auth or upstream fault, which then sends recovery
+ * and productivity review chasing a problem that never happened.
+ */
+export const PROCESS_SIGNAL_TERMINATED_ERROR_CODE = "process_signal_terminated";
+
+/**
+ * Shell exit codes that encode a fatal signal as 128 + N. A signal delivered to
+ * a CLI behind a shell wrapper reaches the caller as one of these codes rather
+ * than as `signal`, so both shapes have to be recognised: SIGINT (130),
+ * SIGKILL (137), SIGTERM (143).
+ */
+const PROCESS_SIGNAL_TERMINATION_EXIT_CODES = new Set([130, 137, 143]);
+
+/**
+ * True when the OS killed this process. A timeout is deliberately excluded: the
+ * runner kills a timed-out process itself and already reports the typed timeout
+ * disposition, which carries more information than "something signalled us".
+ */
+export function isProcessSignalTerminated(
+  proc: Pick<RunProcessResult, "signal" | "exitCode" | "timedOut">,
+): boolean {
+  if (proc.timedOut) return false;
+  return (
+    proc.signal != null ||
+    PROCESS_SIGNAL_TERMINATION_EXIT_CODES.has(proc.exitCode ?? -1)
+  );
 }
 
 export interface TerminalResultCleanupOptions {
@@ -3441,7 +3476,7 @@ export async function runChildProcess(
     graceSec: number;
     onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
     onLogError?: (err: unknown, runId: string, message: string) => void;
-    onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+    onSpawn?: (meta: RunProcessSpawnMeta) => Promise<void>;
     terminalResultCleanup?: TerminalResultCleanupOptions;
     stdin?: string;
     remoteExecution?: RemoteExecutionSpec | null;
@@ -3484,10 +3519,11 @@ export async function runChildProcess(
         for (const [key, value] of Object.entries(childEnv)) {
           if (value === undefined) delete childEnv[key];
         }
+        const detached = process.platform !== "win32";
         const child = spawn(target.command, target.args, {
           cwd: target.cwd ?? opts.cwd,
           env: childEnv,
-          detached: process.platform !== "win32",
+          detached,
           shell: false,
           stdio: [opts.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
         }) as ChildProcessWithEvents;
@@ -3496,7 +3532,20 @@ export async function runChildProcess(
 
         const spawnPersistPromise =
           typeof child.pid === "number" && child.pid > 0 && opts.onSpawn
-            ? opts.onSpawn({ pid: child.pid, processGroupId, startedAt }).catch((err) => {
+            ? opts.onSpawn({
+              pid: child.pid,
+              processGroupId,
+              startedAt,
+              // This is the CLI lane: the provider's own CLI, spawned as its
+              // own process-group leader everywhere we can detach. Record the
+              // lane so the server does not have to re-derive it from adapter
+              // config, which does not determine it. Windows cannot detach, so
+              // the child stays bound to this server process and is reported as
+              // such rather than as an adoptable detached group.
+              executionEngine: "cli",
+              processTopology:
+                detached && processGroupId !== null ? "detached" : "server_stdio",
+            }).catch((err) => {
               onLogError(err, runId, "failed to record child process metadata");
             })
             : Promise.resolve();

@@ -34,6 +34,8 @@ import {
 import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
+import { reportDevWatchStaleness } from "./dev-watch-staleness.js";
+import { primeServerInfoBootStamp } from "./server-info.js";
 import { logger } from "./middleware/logger.js";
 import {
   StartupRefusalError,
@@ -90,7 +92,11 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
-import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import {
+  buildRuntimeApiCandidateUrls,
+  choosePrimaryRuntimeApiUrl,
+  probeReachableRuntimeApiUrl,
+} from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -156,6 +162,16 @@ export interface StartedServer {
 
 export async function startServer(): Promise<StartedServer> {
   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
+  // AND-30: the dev-watch wrapper reads its config once at start and `tsx
+  // watch` never re-executes it, so a wrapper left running from before a
+  // dev-watch change keeps the old behaviour indefinitely. Say so at boot
+  // rather than letting a stale wrapper silently interrupt agent runs.
+  reportDevWatchStaleness((payload, message) => logger.warn(payload, message));
+  // AND-69: same class, one level down. Anchor the "what commit did this
+  // process load" stamp to boot now, so /health can report drift between the
+  // running code and the checkout instead of re-reading HEAD and always
+  // looking current.
+  primeServerInfoBootStamp();
 
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.
@@ -1063,6 +1079,10 @@ export async function startServer(): Promise<StartedServer> {
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+  // The scheduler ticks every 30s. A stranded issue that already survived the detector does
+  // not need sub-minute escalation latency, and classifying the whole issue graph per company
+  // is the expensive half of this reconciler.
+  const ISSUE_GRAPH_LIVENESS_ESCALATION_MIN_INTERVAL_MS = 5 * 60 * 1000;
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
@@ -1358,6 +1378,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const livenessEscalated = await heartbeat.reconcileIssueGraphLivenessEscalations();
+        if (livenessEscalated.created > 0 || livenessEscalated.failed > 0) {
+          logger.warn(
+            { ...livenessEscalated },
+            "startup issue-graph liveness escalation opened recovery work for critical findings",
+          );
+        }
+
         const scanned = await heartbeat.scanSilentActiveRuns();
         if (scanned.created > 0 || scanned.escalated > 0) {
           logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
@@ -1594,6 +1622,17 @@ export async function startServer(): Promise<StartedServer> {
               }
             })
             .then(async () => {
+              const escalated = await heartbeat.reconcileIssueGraphLivenessEscalations({
+                minIntervalMs: ISSUE_GRAPH_LIVENESS_ESCALATION_MIN_INTERVAL_MS,
+              });
+              if (escalated.created > 0 || escalated.failed > 0) {
+                logger.warn(
+                  { ...escalated },
+                  "periodic issue-graph liveness escalation opened recovery work for critical findings",
+                );
+              }
+            })
+            .then(async () => {
               const scanned = await heartbeat.scanSilentActiveRuns();
               if (scanned.created > 0 || scanned.escalated > 0) {
                 logger.warn({ ...scanned }, "periodic active-run output watchdog created review work");
@@ -1730,7 +1769,42 @@ export async function startServer(): Promise<StartedServer> {
       resolveListen();
     });
   });
-  
+
+  // AND-8: `choosePrimaryRuntimeApiUrl` derives the injected PAPERCLIP_API_URL
+  // from config alone. With `auth.baseUrlMode: "auto"` and a wildcard bind it
+  // takes `allowedHostnames[0]` verbatim, so a stale entry (a MagicDNS name
+  // that now belongs to a different, offline tailnet peer) silently hands every
+  // spawned agent a dead control-plane URL. The agent can neither read nor
+  // write the board and the run ends as a no-op indistinguishable from an idle
+  // agent. Probe the already-derived candidate list now that we are listening
+  // and pin the first origin that actually answers. The configured host is
+  // probed first, so a deliberate external URL still wins whenever it works.
+  {
+    const reachableApiUrl = await probeReachableRuntimeApiUrl({
+      candidates: runtimeApiCandidates,
+    });
+    if (!reachableApiUrl) {
+      logger.warn(
+        { candidates: runtimeApiCandidates, injectedApiUrl: configuredApiUrl },
+        "no runtime API candidate answered a health probe; agents will inherit the configured PAPERCLIP_API_URL unverified",
+      );
+    } else if (reachableApiUrl !== configuredApiUrl) {
+      logger.warn(
+        {
+          configuredApiUrl,
+          reachableApiUrl,
+          candidates: runtimeApiCandidates,
+          allowedHostnames: config.allowedHostnames,
+        },
+        "configured runtime API URL is unreachable from this host; injecting the first reachable candidate into agent runs instead",
+      );
+      process.env.PAPERCLIP_API_URL = reachableApiUrl;
+      process.env.PAPERCLIP_RUNTIME_API_URL = reachableApiUrl;
+    } else {
+      logger.info({ reachableApiUrl }, "verified runtime API URL injected into agent runs");
+    }
+  }
+
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);

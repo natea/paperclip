@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gte, inArray, isNotNull, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -410,6 +410,23 @@ export function agentService(db: Db) {
       ...row,
       spentMonthlyCents: spendByAgentId.get(row.id) ?? 0,
     }));
+  }
+
+  /**
+   * AND-47: scrub a stale `errorReason` without touching `status`.
+   *
+   * The reason string belongs to the run that failed. Once a retry or an
+   * adoption has moved the agent back to a healthy status the string is a lie,
+   * and it is what the agent page and `GET /api/agents/{id}` show. The write is
+   * conditional on the column being non-null so a genuine no-op costs no row
+   * version.
+   */
+  async function clearStaleErrorReason(id: string) {
+    await db
+      .update(agents)
+      .set({ errorReason: null, updatedAt: new Date() })
+      .where(and(eq(agents.id, id), isNotNull(agents.errorReason)));
+    return getById(id);
   }
 
   async function getById(id: string) {
@@ -907,8 +924,14 @@ export function agentService(db: Db) {
       if (existing.status === "pending_approval") {
         throw conflict("Pending approval agents cannot have errors cleared");
       }
+      // AND-47: clearing an error is idempotent on any live status. A manager
+      // recovering a report used to lose a race with the auto-retry -- the
+      // retry moved the agent to `running` and the 409 then refused to scrub
+      // the failed run's `errorReason`, leaving it unclearable through the API.
+      // Outside `error` we only scrub the stale reason: forcing a `running`
+      // agent to `idle` would be a worse bug than the one being fixed.
       if (existing.status !== "error") {
-        throw conflict("Only agents in error status can have their error cleared");
+        return clearStaleErrorReason(id);
       }
 
       const updated = await db
@@ -924,8 +947,10 @@ export function agentService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null);
 
+      // Lost the race: something moved the agent out of `error` between the
+      // read and this write. Same idempotent answer as above.
       if (!updated) {
-        throw conflict("Only agents in error status can have their error cleared");
+        return clearStaleErrorReason(id);
       }
       return getById(updated.id);
     },

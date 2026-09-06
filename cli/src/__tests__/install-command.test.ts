@@ -98,6 +98,8 @@ describe("managed install commands", () => {
     const packageRoot = path.join(payloadPath, "node_modules", "paperclipai");
     fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
     fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" }));
+    // allow-env-shebang: inert bytes standing in for an installed entrypoint. The
+    // installer runs it through `process.execPath`, never through the shebang.
     fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n");
     const runCommand = vi.fn(async (_file: string, _args: string[]) => ({ stdout: "0.3.1\n", stderr: "" }));
     await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, paths)).resolves.toEqual({ payloadPath, reused: true, version: "0.3.1" });
@@ -141,6 +143,7 @@ describe("managed install commands", () => {
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
       }
+      // allow-env-shebang: inert bytes; the installer spawns `process.execPath`.
       if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
         fs.mkdirSync(args[2], { recursive: true });
@@ -222,6 +225,7 @@ describe("managed install commands", () => {
         const prefix = args[args.indexOf("--prefix") + 1];
         const entrypoint = path.join(prefix, "node_modules", "paperclipai", "dist", "index.js");
         fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
+        // allow-env-shebang: inert bytes; the installer spawns `process.execPath`.
         fs.writeFileSync(entrypoint, "#!/usr/bin/env node\n");
         return { stdout: "", stderr: "" };
       }

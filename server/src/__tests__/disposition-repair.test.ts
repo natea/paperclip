@@ -5,6 +5,7 @@ import {
   DISPOSITION_REPAIR_BASE_DELAYS_MS,
   DISPOSITION_REPAIR_MAX_ATTEMPTS,
   dispositionRepairDelayMs,
+  durableWaitingPathReason,
 } from "../services/recovery/disposition-repair.ts";
 
 const deliberateWaitRun = {
@@ -49,5 +50,57 @@ describe("owner-sticky disposition repair", () => {
     expect(timings[4]?.jitterMs).toBeLessThanOrEqual(48_000);
     expect(dispositionRepairDelayMs(2, fingerprint)).toEqual(timings[1]);
     expect(() => dispositionRepairDelayMs(6, fingerprint)).toThrow(/Invalid disposition repair attempt/);
+  });
+
+  describe("durable waiting path (AND-50)", () => {
+    const now = new Date("2026-09-06T00:00:00.000Z");
+    const base = {
+      hasBlocker: false,
+      hasPendingExecutionStage: false,
+      pendingInteraction: false,
+      pendingApproval: false,
+      now,
+    };
+    const monitoredIssue = (overrides: Record<string, unknown> = {}) => ({
+      id: "issue-1",
+      companyId: "company-1",
+      status: "in_review",
+      assigneeAgentId: "agent-1",
+      assigneeUserId: null,
+      executionPolicy: null,
+      executionState: null,
+      monitorNextCheckAt: new Date("2026-09-06T01:00:00.000Z"),
+      ...overrides,
+    }) as never;
+
+    it("counts a monitor the scheduler would claim", () => {
+      expect(durableWaitingPathReason({ ...base, issue: monitoredIssue() })).toBe("monitor");
+    });
+
+    it("does not count a monitor on an issue the scheduler skips", () => {
+      expect(
+        durableWaitingPathReason({ ...base, issue: monitoredIssue({ assigneeAgentId: null }) }),
+      ).toBeNull();
+      expect(
+        durableWaitingPathReason({ ...base, issue: monitoredIssue({ status: "backlog" }) }),
+      ).toBeNull();
+      expect(
+        durableWaitingPathReason({
+          ...base,
+          issue: monitoredIssue({
+            executionPolicy: { monitor: { timeoutAt: "2026-09-05T00:00:00.000Z" } },
+          }),
+        }),
+      ).toBeNull();
+    });
+
+    it("keeps the user owner ahead of an unschedulable monitor", () => {
+      expect(
+        durableWaitingPathReason({
+          ...base,
+          issue: monitoredIssue({ assigneeAgentId: null, assigneeUserId: "user-1" }),
+        }),
+      ).toBe("user_owner");
+    });
   });
 });

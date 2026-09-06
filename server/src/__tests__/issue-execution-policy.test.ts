@@ -930,6 +930,75 @@ describe("issue execution policy transitions", () => {
       // Not in_review, so no status/assignee change
       expect(result.patch.status).toBeUndefined();
     });
+
+    // AND-57: a 2xx PATCH must never silently replace a status the caller
+    // explicitly asked for. Dissolving a stranded review is a repair, not a
+    // verdict, so it must not outrank an explicit terminal status in the same
+    // request. The sibling "stage no longer exists" branch already guards on
+    // requestedStatus; this branch must match it.
+    it("does not override an explicitly requested status when dissolving a stranded review", () => {
+      const stageId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: null,
+          executionState: {
+            status: "pending",
+            currentStageId: stageId,
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy: null,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+      });
+
+      expect(result.patch.executionState).toBeNull();
+      expect(result.patch.status).toBeUndefined();
+      expect(result.patch.assigneeAgentId).toBeUndefined();
+    });
+
+    // The same invariant for the sibling branch (policy still present, but the
+    // stage the state points at is gone). This one already passes; it is here
+    // so the pair cannot drift apart again.
+    it("does not override an explicitly requested status when the pending stage no longer exists", () => {
+      const policy = reviewOnlyPolicy();
+      const result = applyIssueExecutionPolicyTransition({
+        issue: {
+          status: "in_review",
+          assigneeAgentId: qaAgentId,
+          assigneeUserId: null,
+          executionPolicy: policy,
+          executionState: {
+            status: "pending",
+            currentStageId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            currentStageIndex: 0,
+            currentStageType: "review",
+            currentParticipant: { type: "agent", agentId: qaAgentId },
+            returnAssignee: { type: "agent", agentId: coderAgentId },
+            completedStageIds: [],
+            lastDecisionId: null,
+            lastDecisionOutcome: null,
+          },
+        },
+        policy,
+        requestedStatus: "done",
+        requestedAssigneePatch: {},
+        actor: { agentId: qaAgentId },
+      });
+
+      expect(result.patch.executionState).toBeNull();
+      expect(result.patch.status).toBeUndefined();
+    });
   });
 
   describe("reopening from done/cancelled clears state", () => {

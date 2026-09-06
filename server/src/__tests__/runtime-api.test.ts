@@ -3,6 +3,7 @@ import {
   buildRuntimeApiCandidateUrls,
   choosePrimaryRuntimeApiUrl,
   collectReachableInterfaceHosts,
+  probeReachableRuntimeApiUrl,
 } from "../runtime-api.js";
 
 describe("runtime API discovery", () => {
@@ -154,5 +155,90 @@ describe("runtime API discovery", () => {
       "192.168.6.178",
       "fd7a:115c:a1e0::8a3a:a11d",
     ]);
+  });
+});
+
+describe("probeReachableRuntimeApiUrl", () => {
+  const unreachable = (host: string) => `http://${host}:3100`;
+
+  it("keeps the configured host when it answers, without probing later candidates", async () => {
+    const probed: string[] = [];
+    const fetchImpl = (async (url: string | URL) => {
+      probed.push(String(url));
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await expect(
+      probeReachableRuntimeApiUrl({
+        candidates: [unreachable("paperclip.example.com"), unreachable("127.0.0.1")],
+        fetchImpl,
+      }),
+    ).resolves.toBe(unreachable("paperclip.example.com"));
+    expect(probed).toEqual(["http://paperclip.example.com:3100/api/health"]);
+  });
+
+  it("falls through a stale MagicDNS entry to the first candidate that answers", async () => {
+    // AND-8: allowedHostnames[0] pointed at an offline tailnet peer, so every
+    // agent inherited a dead control-plane URL.
+    const fetchImpl = (async (url: string | URL) => {
+      if (String(url).includes("openclaw")) throw new Error("ETIMEDOUT");
+      return new Response(null, { status: 200 });
+    }) as unknown as typeof fetch;
+
+    await expect(
+      probeReachableRuntimeApiUrl({
+        candidates: [unreachable("openclaw"), unreachable("backlit.local"), unreachable("127.0.0.1")],
+        fetchImpl,
+      }),
+    ).resolves.toBe(unreachable("backlit.local"));
+  });
+
+  it("treats any HTTP answer as reachable, including 401 and 404", async () => {
+    const fetchImpl = (async () => new Response(null, { status: 401 })) as unknown as typeof fetch;
+
+    await expect(
+      probeReachableRuntimeApiUrl({ candidates: [unreachable("127.0.0.1")], fetchImpl }),
+    ).resolves.toBe(unreachable("127.0.0.1"));
+  });
+
+  it("returns null when no candidate answers so the caller can warn instead of silently rewriting", async () => {
+    const fetchImpl = (async () => {
+      throw new Error("ETIMEDOUT");
+    }) as unknown as typeof fetch;
+
+    await expect(
+      probeReachableRuntimeApiUrl({
+        candidates: [unreachable("openclaw"), unreachable("127.0.0.1")],
+        fetchImpl,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  it("skips blank candidates and returns null for an empty list", async () => {
+    const fetchImpl = (async () => new Response(null, { status: 200 })) as unknown as typeof fetch;
+
+    await expect(probeReachableRuntimeApiUrl({ candidates: [], fetchImpl })).resolves.toBeNull();
+    await expect(
+      probeReachableRuntimeApiUrl({ candidates: ["", "   "], fetchImpl }),
+    ).resolves.toBeNull();
+  });
+
+  it("gives up on a hanging candidate at the timeout instead of stalling boot", async () => {
+    const fetchImpl = ((url: string | URL, init?: RequestInit) => {
+      if (String(url).includes("openclaw")) {
+        return new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => reject(new Error("aborted")));
+        });
+      }
+      return Promise.resolve(new Response(null, { status: 200 }));
+    }) as unknown as typeof fetch;
+
+    await expect(
+      probeReachableRuntimeApiUrl({
+        candidates: [unreachable("openclaw"), unreachable("127.0.0.1")],
+        timeoutMs: 10,
+        fetchImpl,
+      }),
+    ).resolves.toBe(unreachable("127.0.0.1"));
   });
 });

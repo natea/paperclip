@@ -169,3 +169,50 @@ export function buildRuntimeApiCandidateUrls(input: {
 
   return candidates;
 }
+
+/**
+ * Probe `candidates` in order and return the first origin that answers.
+ *
+ * `choosePrimaryRuntimeApiUrl` derives the injected `PAPERCLIP_API_URL` from
+ * config alone: with `auth.baseUrlMode: "auto"` and a wildcard bind it takes
+ * `allowedHostnames[0]` verbatim. When that entry is stale — e.g. a MagicDNS
+ * name that now belongs to a different, offline tailnet peer — every spawned
+ * agent inherits a dead control-plane URL, cannot read or write the board, and
+ * the run ends as a silent no-op indistinguishable from an idle agent. (AND-8)
+ *
+ * Probing after listen turns the already-derived candidate list into a real
+ * self-heal: the configured host is still tried first, so an intentional
+ * external URL keeps winning whenever it actually works.
+ */
+export async function probeReachableRuntimeApiUrl(input: {
+  candidates: string[];
+  timeoutMs?: number;
+  probePath?: string;
+  fetchImpl?: typeof fetch;
+}): Promise<string | null> {
+  const timeoutMs = input.timeoutMs ?? 1500;
+  const probePath = input.probePath ?? "/api/health";
+  const fetchImpl = input.fetchImpl ?? fetch;
+
+  for (const candidate of input.candidates) {
+    const origin = candidate.trim();
+    if (!origin) continue;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      // Any HTTP answer proves the origin routes to a live listener. A 401/404
+      // still means reachable, which is all this probe decides.
+      await fetchImpl(`${origin.replace(/\/$/, "")}${probePath}`, {
+        method: "GET",
+        signal: controller.signal,
+      });
+      return origin;
+    } catch {
+      // Unreachable candidate: fall through to the next one.
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  return null;
+}
