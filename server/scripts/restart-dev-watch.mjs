@@ -40,12 +40,13 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { bootAssertionState } from "./boot-assertion-state.mjs";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const serverRoot = path.resolve(path.dirname(scriptPath), "..");
 const repoRoot = path.resolve(serverRoot, "..");
 const verifierPath = path.join(serverRoot, "scripts", "verify-dev-watch-live.mjs");
-const patchPath = path.join(serverRoot, "scripts", "and-30-boot-assertion.patch");
+const indexPath = path.join(serverRoot, "src", "index.ts");
 
 const argv = new Set(process.argv.slice(2));
 const DETACHED_PHASE = argv.has("--detached-phase");
@@ -100,7 +101,7 @@ let result = {
   forced: FORCE,
   ownRunId: process.env.PAPERCLIP_RUN_ID ?? null,
   pids: {},
-  patch: null,
+  bootAssertion: null,
   quietWindow: null,
   verifier: { attempts: 0, lastExitCode: null, stdout: null },
   relaunchAttempts: 0,
@@ -277,49 +278,26 @@ async function checkQuietWindow() {
 }
 
 // ---------------------------------------------------------------------------
-// step 3: the AND-30 boot assertion patch
+// step 3: the AND-30 boot assertion
+//
+// This used to apply and commit `and-30-boot-assertion.patch` here, because the
+// assertion could not be edited into `server/src/index.ts` from inside an agent
+// run — the edit restarts the server and drains the run making it, and this
+// script's detached half is the one place that restart is deliberate. The patch
+// landed in `7f166e1f5` and the file is gone (AND-39), so the only thing left to
+// do at this point is confirm the assertion is still in the source we are about
+// to restart. If it is not, restarting produces a server that will not tell the
+// next operator its wrapper is stale — which is the whole failure AND-30 exists
+// to surface, so refuse rather than restart blind.
 
-function git(args, options = {}) {
-  return spawnSync("git", args, { cwd: repoRoot, encoding: "utf8", ...options });
-}
-
-function patchState() {
-  if (!fs.existsSync(patchPath)) return { state: "missing" };
-  if (git(["apply", "--check", patchPath]).status === 0) return { state: "appliable" };
-  if (git(["apply", "--reverse", "--check", patchPath]).status === 0) return { state: "already_applied" };
-  return { state: "conflicted" };
-}
-
-function applyPatchAndCommit() {
-  const before = patchState();
-  if (before.state === "already_applied") {
-    return { state: "already_applied", committed: false };
+function checkBootAssertion() {
+  let source;
+  try {
+    source = fs.readFileSync(indexPath, "utf8");
+  } catch (err) {
+    return { state: "unreadable", missing: [], error: String(err?.message ?? err) };
   }
-  if (before.state !== "appliable") {
-    return { state: before.state, committed: false, error: `patch is ${before.state}` };
-  }
-  const applied = git(["apply", patchPath]);
-  if (applied.status !== 0) {
-    return { state: "apply_failed", committed: false, error: applied.stderr?.trim() };
-  }
-  // Commit so the change survives the restart it is about to cause, and so the
-  // tree is not left dirty for whoever looks next.
-  const relative = path.relative(repoRoot, path.join(serverRoot, "src", "index.ts"));
-  git(["add", "--", relative]);
-  const message = [
-    "feat(server): assert dev-watch freshness at boot (AND-30, AND-34)",
-    "",
-    "Held back as server/scripts/and-30-boot-assertion.patch because applying it",
-    "edits server/src/index.ts, which restarts the dev server and drains every",
-    "in-flight agent run. Applied by server/scripts/restart-dev-watch.mjs at the",
-    "one moment that restart is deliberate.",
-  ].join("\n");
-  const committed = git(["commit", "-m", message, "--no-verify"]);
-  if (committed.status !== 0) {
-    return { state: "applied", committed: false, error: committed.stderr?.trim() || committed.stdout?.trim() };
-  }
-  const sha = git(["rev-parse", "HEAD"]).stdout?.trim() ?? null;
-  return { state: "applied", committed: true, commit: sha };
+  return bootAssertionState(source);
 }
 
 // ---------------------------------------------------------------------------
@@ -447,24 +425,23 @@ async function detachedPhase() {
     writeResult({
       outcome: "aborted_not_quiet",
       finishedAt: nowIso(),
-      instanceState: "untouched — nothing was stopped, no patch was applied",
+      instanceState: "untouched — nothing was stopped",
       recovery: "Re-run `node server/scripts/restart-dev-watch.mjs` when no other agent run is in flight.",
     });
     log(`aborting: ${quiet.blocking.length} other run(s) in flight or run listing unavailable (${quiet.reason ?? ""})`);
     process.exit(3);
   }
 
-  // Step 3: apply the boot assertion. This is the moment it is safe to edit
-  // server/src/index.ts, because the restart it triggers is the one we want.
-  const patch = DRY_RUN ? { state: "skipped_dry_run", committed: false } : applyPatchAndCommit();
-  writeResult({ patch });
-  log(`patch: ${JSON.stringify(patch)}`);
-  if (patch.state === "conflicted" || patch.state === "apply_failed") {
+  // Step 3: re-confirm the boot assertion at the point of no return.
+  const bootAssertion = checkBootAssertion();
+  writeResult({ bootAssertion });
+  log(`bootAssertion: ${JSON.stringify(bootAssertion)}`);
+  if (bootAssertion.state !== "present") {
     writeResult({
-      outcome: "aborted_patch_failed",
+      outcome: "aborted_boot_assertion_missing",
       finishedAt: nowIso(),
       instanceState: "untouched — the dev tree is still running the stale wrapper",
-      recovery: "Resolve server/scripts/and-30-boot-assertion.patch against server/src/index.ts by hand, then re-run this script.",
+      recovery: "server/src/index.ts is missing the AND-30 boot assertion (reportDevWatchStaleness in startServer). Restore it, then re-run this script.",
     });
     process.exit(1);
   }
@@ -556,7 +533,7 @@ async function detachedPhase() {
     recovery: [
       `Read ${devWatchLogPath} for why the relaunch did not come up.`,
       "From the repo root: `pnpm dev:stop`, then `pnpm dev:watch`, then `node server/scripts/verify-dev-watch-live.mjs`.",
-      "The AND-30 boot assertion is already applied and committed; do not re-apply the patch.",
+      "The AND-30 boot assertion is already applied and committed in server/src/index.ts; there is no patch to apply.",
     ].join(" "),
   });
   log("FAILED: relaunch did not come back LIVE within the deadline");
@@ -598,7 +575,7 @@ async function foregroundPhase() {
     writeResult({
       outcome: "aborted_not_quiet",
       finishedAt: nowIso(),
-      instanceState: "untouched — nothing was stopped, no patch was applied",
+      instanceState: "untouched — nothing was stopped",
       recovery: "Re-run when the instance is quiet, or pass --force to override the check deliberately.",
     });
     console.error(`\nABORT: ${detail}`);
@@ -608,16 +585,16 @@ async function foregroundPhase() {
     console.log(`note: ${quiet.queued.length} queued run(s) present; queued runs have not started, so the restart does not interrupt them`);
   }
 
-  const patch = patchState();
-  if (patch.state === "conflicted" || patch.state === "missing") {
+  const bootAssertion = checkBootAssertion();
+  if (bootAssertion.state !== "present") {
     writeResult({
-      outcome: "aborted_patch_failed",
-      patch,
+      outcome: "aborted_boot_assertion_missing",
+      bootAssertion,
       finishedAt: nowIso(),
       instanceState: "untouched",
-      recovery: `server/scripts/and-30-boot-assertion.patch is ${patch.state}; fix it before restarting.`,
+      recovery: "server/src/index.ts is missing the AND-30 boot assertion (reportDevWatchStaleness in startServer); restore it before restarting.",
     });
-    console.error(`\nABORT: boot assertion patch is ${patch.state}`);
+    console.error(`\nABORT: boot assertion is ${bootAssertion.state} (missing: ${bootAssertion.missing.join(", ") || "n/a"})`);
     return 1;
   }
 
