@@ -94,6 +94,17 @@ for (const watcher of watchers) {
       console.log(`  FAIL  server child ${child.pid} has no PAPERCLIP_DEV_WATCH=1`);
       console.log("        -> drainRunningRunsForShutdown will interrupt every in-flight agent run on each restart");
     }
+
+    // Check 3 (AND-32): is this the last manual restart? The wrapper's argv is
+    // identical with and without self-healing, so it marks the child instead.
+    if (/\bPAPERCLIP_DEV_WATCH_SELF_HEAL=1\b/.test(env)) {
+      console.log(`  PASS  server child ${child.pid} was spawned by a self-healing wrapper (AND-32)`);
+    } else {
+      failed = true;
+      console.log(`  FAIL  server child ${child.pid} has no PAPERCLIP_DEV_WATCH_SELF_HEAL=1`);
+      console.log("        -> this wrapper predates AND-32: it will not pick up its own future changes,");
+      console.log("           and will not tell you when it has gone stale. Restart it once when idle.");
+    }
   }
 }
 

@@ -31,8 +31,18 @@ describe("dev-watch restart signal wiring (AND-18)", () => {
 
     expect(script).toContain('PAPERCLIP_DEV_WATCH: "1"');
     // The marker has to reach the child on top of the inherited environment;
-    // `env: process.env` alone would silently drop it.
-    expect(script).toMatch(/env:\s*\{\s*\.\.\.process\.env,\s*PAPERCLIP_DEV_WATCH: "1",?\s*\}/);
+    // `env: process.env` alone would silently drop it. AND-32 added further
+    // entries to the child env, so this pins the two invariants that matter
+    // rather than the exact literal: the inherited env is spread first, and the
+    // marker is set after it (so nothing can spread over the top of it).
+    const childEnv = /const childEnv:[^=]*=\s*\{([\s\S]*?)\n\};/.exec(script)?.[1];
+    expect(childEnv).toBeDefined();
+    expect(childEnv).toContain("...process.env");
+    expect(childEnv!.indexOf("...process.env")).toBeLessThan(
+      childEnv!.indexOf('PAPERCLIP_DEV_WATCH: "1"'),
+    );
+    expect(childEnv!.lastIndexOf("...")).toBeLessThan(childEnv!.indexOf('PAPERCLIP_DEV_WATCH: "1"'));
+    expect(script).toMatch(/env:\s*childEnv,/);
   });
 
   it("gates run preservation on that marker and on SIGTERM alone", () => {
@@ -43,5 +53,30 @@ describe("dev-watch restart signal wiring (AND-18)", () => {
     expect(heartbeatService).toContain(
       'signal === "SIGTERM" && process.env.PAPERCLIP_DEV_WATCH === "1"',
     );
+  });
+
+  it("gates the AND-32 self-heal re-exec on the shared decision function", () => {
+    const script = readFileSync(devWatchScriptPath, "utf8");
+
+    // The run-safety gates live in evaluateSelfHealDecision and are covered in
+    // dev-watch-self-heal.test.ts. If the wrapper ever re-execs on some other
+    // condition, those tests keep passing while the guarantee is gone.
+    expect(script).toContain("evaluateSelfHealDecision({");
+    expect(script).toMatch(/if \(decision\.action === "re-exec"\) \{\s*beginReExec\(\);/);
+    expect(script).toMatch(/selfCheck,/);
+    expect(script).toMatch(/activeRunCount,/);
+  });
+
+  it("does not let the re-exec path swallow Ctrl-C", () => {
+    const script = readFileSync(devWatchScriptPath, "utf8");
+
+    // Signal handlers are installed only for the re-exec window, and a signal
+    // arriving inside it cancels the heal and terminates instead.
+    expect(script).toContain("interruptedDuringReExec = signal;");
+    expect(script).toMatch(/if \(reExecInProgress && interruptedDuringReExec === null\) \{/);
+    // Outside the window the default disposition must be restored, or a later
+    // Ctrl-C would be handled by a listener that only sets a flag.
+    expect(script).toContain("disarmReExecSignalGuards();");
+    expect(script).toMatch(/process\.kill\(process\.pid, effectiveSignal\)/);
   });
 });
