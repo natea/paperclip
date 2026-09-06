@@ -1325,6 +1325,97 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(agent).toEqual({ status: "running", errorReason: null });
   });
 
+  it("clears the stale errorReason when the process-loss retry starts successfully", async () => {
+    // AND-47: `error` is an invokable status, so the retry run flips the agent
+    // straight from `error` to `running`. That write used to carry the dead
+    // run's errorReason forward onto a perfectly healthy agent, and
+    // `clear-error` then refused to scrub it.
+    const { agentId, runId } = await seedQueuedIssueRunFixture();
+
+    // Run 1 was launched and its child died without a terminal record.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        processPid: 999_999_999,
+        processGroupId: 999_999_999,
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "claimed", claimedAt: new Date("2026-03-19T00:00:00.000Z") })
+      .where(eq(agentWakeupRequests.runId, runId));
+
+    const heartbeat = heartbeatService(db);
+    const reaped = await heartbeat.reapOrphanedRuns();
+    expect(reaped.runIds).toEqual([runId]);
+
+    const lostRun = await heartbeat.getRun(runId);
+    expect(lostRun).toMatchObject({ status: "failed", errorCode: "process_lost" });
+
+    // Precondition the fix depends on: the reap really did stamp a reason on
+    // the agent row. Without this the assertion below would pass vacuously.
+    const afterLoss = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(afterLoss?.errorReason).toContain("Process lost");
+
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun).not.toBeNull();
+
+    // Probe the agent row from inside the adapter call: that is the window the
+    // bug lived in. Asserting only after the run settles would pass on the
+    // unfixed code too, because finalizeAgentStatus clears the reason on the
+    // way out of a successful run -- the whole complaint in AND-47 is that the
+    // agent advertises a dead failure for the entire time it is running.
+    let errorReasonWhileRunning: string | null | undefined;
+    let statusWhileRunning: string | undefined;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const row = await db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+      errorReasonWhileRunning = row?.errorReason;
+      statusWhileRunning = row?.status;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Recovered stranded heartbeat work.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    // Run 2 succeeds.
+    if (retryRun?.status === "queued") {
+      await heartbeat.resumeQueuedRuns();
+    }
+    await waitForRunToSettle(heartbeat, retryRun!.id);
+    await heartbeat.waitForRunExecutionDrain(retryRun!.id);
+
+    expect(statusWhileRunning).toBe("running");
+    expect(errorReasonWhileRunning).toBeNull();
+
+    const recovered = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(recovered?.errorReason).toBeNull();
+    expect(recovered?.status).not.toBe("error");
+  });
+
   it("files an escalation against the manager when an agent falls into error", async () => {
     // AND-43 defect 2: the transition into `error` used to be silent -- the
     // agent stopped heartbeating and the only signal was a human listing
