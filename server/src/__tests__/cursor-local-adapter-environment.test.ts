@@ -29,7 +29,14 @@ console.log(JSON.stringify({
 }
 
 async function writeFakeCursorAgentCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  // Absolute shebang, not `#!/usr/bin/env node`. The sandbox probe is handed the
+  // adapter config `env`, which deliberately carries no PATH, so the adapter
+  // falls back to `defaultPathForPlatform()`. That default does not contain a
+  // Node install on every dev box (nvm/volta/asdf all live under $HOME), and an
+  // env-shebang fixture then dies with `env: node: No such file or directory`
+  // during the version probe — a fixture failure that reads as an adapter bug.
+  // Pinning the interpreter keeps this test about command resolution only.
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
