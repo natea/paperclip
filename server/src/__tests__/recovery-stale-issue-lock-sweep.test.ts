@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -633,5 +634,202 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
       .from(heartbeatRunEvents)
       .where(eq(heartbeatRunEvents.runId, runningRunId));
     expect(events).toEqual([]);
+  });
+  // AND-45. A run held by an `in_progress` issue is the case where a stale lock
+  // hurts most: the assignee's own live run gets 409 on checkout and on PATCH,
+  // so the issue can never be closed or transitioned. The three tests below pin
+  // the full liveness contract for that shape — dead clears, alive is preserved,
+  // and unknown stays conservative.
+
+  it("clears the lock on an in_progress issue when the run's process is gone", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    // A pid far above any real one, so nothing holds it and the verdict is a
+    // provable death rather than "cannot tell".
+    await db
+      .update(heartbeatRuns)
+      .set({ processPid: 2_000_000_000, processGroupId: 2_000_000_000 })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Dead run held by an in_progress issue",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+
+    const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runStatus = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]?.status);
+    expect(runStatus).toBe("interrupted");
+
+    const lock = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock).toEqual({ checkoutRunId: null, executionRunId: null });
+  });
+
+  it("clears the lock on an in_progress issue when the run's pid was recycled", async () => {
+    // The permanent-strand shape. Signal 0 answers for this pid, so the old
+    // check called the run live forever and the lock never became cleanable.
+    // The recorded spawn timestamp is years off the start time the OS reports
+    // for the pid, which proves the process that answered is not ours.
+    const { companyId, agentId, runningRunId } = await seed();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        processPid: process.pid,
+        processGroupId: process.pid,
+        processStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+      })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Recycled pid held by an in_progress issue",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+
+    const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runStatus = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]?.status);
+    expect(runStatus).toBe("interrupted");
+
+    const lock = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock).toEqual({ checkoutRunId: null, executionRunId: null });
+  });
+
+  it("keeps the lock when the run's recorded start matches the live process", async () => {
+    // The genuinely running run: this test process, with the start time the OS
+    // will report for it. The start-time check must confirm ownership rather
+    // than manufacture a death.
+    const { companyId, agentId, runningRunId } = await seed();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        processPid: process.pid,
+        processGroupId: process.pid,
+        processStartedAt: new Date(Date.now() - process.uptime() * 1000),
+      })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Live run held by an in_progress issue",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+
+    const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([]);
+    expect(result.cleared).toBe(0);
+
+    const runStatus = await db
+      .select({ status: heartbeatRuns.status })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]?.status);
+    expect(runStatus).toBe("running");
+
+    const lock = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
+  });
+
+  it("keeps the lock when a live process group cannot be attributed to the run", async () => {
+    // Unknown, not dead: the recorded pid was recycled, but the run also
+    // recorded a different process group that still answers. A surviving member
+    // of that group may still be ours, so the sweep must stay conservative.
+    const { companyId, agentId, runningRunId } = await seed();
+    const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    child.unref();
+    const childPid = child.pid;
+    expect(typeof childPid).toBe("number");
+    try {
+      await db
+        .update(heartbeatRuns)
+        .set({
+          processPid: process.pid,
+          // detached: true makes the child its own group leader, so its pid is
+          // a live group id that is not the recorded pid.
+          processGroupId: childPid,
+          processStartedAt: new Date("2020-01-01T00:00:00.000Z"),
+        })
+        .where(eq(heartbeatRuns.id, runningRunId));
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Unattributable live group held by an in_progress issue",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: runningRunId,
+        executionRunId: runningRunId,
+        executionLockedAt: new Date(),
+      });
+
+      const result = await heartbeatService(db).sweepStaleIssueLocks();
+
+      expect(result.terminalizedRunIds).toEqual([]);
+      expect(result.cleared).toBe(0);
+
+      const runStatus = await db
+        .select({ status: heartbeatRuns.status })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, runningRunId))
+        .then((rows) => rows[0]?.status);
+      expect(runStatus).toBe("running");
+    } finally {
+      if (typeof childPid === "number") {
+        try {
+          process.kill(-childPid, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    }
   });
 });

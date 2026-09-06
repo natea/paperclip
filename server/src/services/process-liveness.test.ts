@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach } from "vitest";
 
 import {
   PROCESS_START_MATCH_TOLERANCE_MS,
+  classifyPidLiveness,
   clearProcessStartCache,
   isPidOwnedByRecordedStart,
   matchProcessStart,
@@ -152,5 +153,80 @@ describe("readProcessStartedAtCached", () => {
     expect(await readProcessStartedAtCached(process.pid)).toBe(first);
     clearProcessStartCache();
     expect(await readProcessStartedAtCached(process.pid)).toBe(first);
+  });
+});
+
+describe("classifyPidLiveness", () => {
+  const recordedStartedAt = new Date("2026-09-06T00:52:35.000Z");
+  const alive = () => true;
+  const gone = () => false;
+
+  it("calls a pid nothing holds dead", async () => {
+    await expect(
+      classifyPidLiveness({
+        pid: 4242,
+        recordedStartedAt,
+        isPidAlive: gone,
+        readStartedAt: async () => {
+          throw new Error("must not be consulted");
+        },
+      }),
+    ).resolves.toBe("dead");
+  });
+
+  it("calls a recycled pid dead even though signal 0 answers", async () => {
+    await expect(
+      classifyPidLiveness({
+        pid: 4242,
+        recordedStartedAt,
+        isPidAlive: alive,
+        readStartedAt: async () => new Date("2026-09-06T04:10:00.000Z"),
+      }),
+    ).resolves.toBe("dead");
+  });
+
+  it("calls a pid whose observed start agrees alive", async () => {
+    await expect(
+      classifyPidLiveness({
+        pid: 4242,
+        recordedStartedAt,
+        isPidAlive: alive,
+        readStartedAt: async () => recordedStartedAt,
+      }),
+    ).resolves.toBe("alive");
+  });
+
+  it("stays unknown when nothing was recorded at spawn", async () => {
+    await expect(
+      classifyPidLiveness({
+        pid: 4242,
+        recordedStartedAt: null,
+        isPidAlive: alive,
+        readStartedAt: async () => {
+          throw new Error("must not be consulted");
+        },
+      }),
+    ).resolves.toBe("unknown");
+  });
+
+  it("stays unknown when the start time cannot be observed", async () => {
+    await expect(
+      classifyPidLiveness({
+        pid: 4242,
+        recordedStartedAt,
+        isPidAlive: alive,
+        readStartedAt: async () => null,
+      }),
+    ).resolves.toBe("unknown");
+  });
+
+  it("stays unknown for a pid that is not a usable process id", async () => {
+    await expect(
+      classifyPidLiveness({
+        pid: 0,
+        recordedStartedAt,
+        isPidAlive: gone,
+      }),
+    ).resolves.toBe("unknown");
   });
 });

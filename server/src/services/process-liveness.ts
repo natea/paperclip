@@ -105,3 +105,48 @@ export async function isPidOwnedByRecordedStart(input: {
   });
   return match !== "mismatch";
 }
+
+/**
+ * Three-valued liveness verdict for a recorded pid.
+ *
+ * `isPidOwnedByRecordedStart` collapses "provably ours" and "cannot tell" into
+ * one boolean, which is right for a caller that only wants to avoid a false
+ * "alive". A caller that wants to *act* on death needs the two apart: only a
+ * `dead` verdict is proof, and `unknown` must stay inert.
+ */
+export type PidLiveness = "alive" | "dead" | "unknown";
+
+/**
+ * Classify the recorded pid of a spawned process.
+ *
+ * - `dead` — nothing holds the pid, or something does but its start time
+ *   provably differs from the one we recorded, so the pid was recycled and our
+ *   process is gone. This is the only verdict that licenses a caller to reclaim
+ *   state owned by that process.
+ * - `alive` — the pid is held and its observed start time matches ours.
+ * - `unknown` — the pid is held but ownership cannot be decided: no recorded
+ *   start time, or the OS start time cannot be read (unsupported platform, a
+ *   sandbox that refuses to spawn `ps`, EPERM). Callers must treat this exactly
+ *   as they treated a plain signal-0 hit before this comparison existed.
+ */
+export async function classifyPidLiveness(input: {
+  pid: number;
+  recordedStartedAt: Date | string | null | undefined;
+  isPidAlive: (pid: number) => boolean;
+  readStartedAt?: (pid: number) => Promise<Date | string | null>;
+  toleranceMs?: number;
+}): Promise<PidLiveness> {
+  if (!Number.isInteger(input.pid) || input.pid <= 0) return "unknown";
+  if (!input.isPidAlive(input.pid)) return "dead";
+  if (input.recordedStartedAt === null || input.recordedStartedAt === undefined)
+    return "unknown";
+  const readStartedAt = input.readStartedAt ?? readProcessStartedAtCached;
+  const match = matchProcessStart({
+    recordedStartedAt: input.recordedStartedAt,
+    observedStartedAt: await readStartedAt(input.pid),
+    toleranceMs: input.toleranceMs,
+  });
+  if (match === "mismatch") return "dead";
+  if (match === "match") return "alive";
+  return "unknown";
+}

@@ -29,6 +29,7 @@ import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../local-service-supervisor.js";
+import { classifyPidLiveness, type PidLiveness } from "../process-liveness.js";
 import { redactSensitiveText } from "../../redaction.js";
 import { isUniqueViolation } from "../../db-errors.js";
 import { logActivity } from "../activity-log.js";
@@ -4487,6 +4488,54 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
 
+  // Is the process that backed this run still alive?
+  //
+  // Three-valued on purpose. A plain signal-0 probe cannot tell "our child is
+  // still running" from "an unrelated process inherited this pid after a restart
+  // or a pid wraparound", and it answers "alive" to both. That false "alive" is
+  // permanent: the run never leaves "running", so a lock held on it never
+  // becomes cleanable. Comparing the recorded spawn timestamp against the start
+  // time the OS reports for the pid turns that case into proof of death.
+  //
+  // Fail-open: only a provable death returns "dead". Missing metadata, an
+  // unreadable OS start time, or a live process group we cannot attribute all
+  // return "unknown", and every caller must treat "unknown" as "leave it alone".
+  async function classifyRunProcessLiveness(
+    run: Pick<
+      typeof heartbeatRuns.$inferSelect,
+      "processPid" | "processGroupId" | "processStartedAt"
+    >,
+  ): Promise<PidLiveness> {
+    const pid = run.processPid ?? null;
+    const processGroupId = run.processGroupId ?? null;
+    // No recorded process metadata: the run may simply not have stored its pid
+    // yet. Nothing to prove either way.
+    if (typeof pid !== "number" && typeof processGroupId !== "number") return "unknown";
+
+    const pidVerdict =
+      typeof pid === "number"
+        ? await classifyPidLiveness({
+            pid,
+            recordedStartedAt: run.processStartedAt,
+            isPidAlive,
+          })
+        : null;
+    if (pidVerdict === "alive") return "alive";
+
+    // The group id is usually the child's own pid, because the child leads its
+    // own group. Probing it then re-asks the same question about the same
+    // (possibly recycled) process, so it carries no independent evidence and the
+    // pid verdict stands alone. A group id that differs is a separate process
+    // group we cannot attribute by start time: if it answers, we cannot rule out
+    // that a surviving group member is ours, so the verdict degrades to unknown.
+    if (typeof processGroupId === "number" && processGroupId !== pid) {
+      if (isProcessGroupAlive(processGroupId)) return "unknown";
+      return pidVerdict === null || pidVerdict === "dead" ? "dead" : "unknown";
+    }
+
+    return pidVerdict === "dead" ? "dead" : "unknown";
+  }
+
   // Backstop reconciler: terminalizes a "running" run that can no longer reach a
   // terminal status on its own. The run finalizer writes the terminal status in
   // a step that is separate from the agent status=done PATCH. When the teardown
@@ -4555,17 +4604,16 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     }
 
     // Process-death authority. The run is live only when a process still backs
-    // it. Check the in-memory handle first, then the recorded pid and process
-    // group. Require recorded process metadata, so this authority never fires on
-    // a run that has not yet stored its pid.
+    // it. Check the in-memory handle first, then the recorded process metadata.
+    // Only a "dead" verdict fires this authority: "unknown" leaves the run
+    // alone, exactly as a plain signal-0 hit did before the start-time
+    // comparison existed. Note that runReferencedByActiveIssue does not gate
+    // this authority — it scopes the issue-terminal authority above. A run whose
+    // process is provably gone is dead for its active issue too, and that is the
+    // case where the issue's lock most needs clearing.
     let processGone = false;
     if (!runningProcesses.get(run.id)) {
-      if (typeof pid === "number" || typeof processGroupId === "number") {
-        const processAlive =
-          (typeof pid === "number" && isPidAlive(pid)) ||
-          (typeof processGroupId === "number" && isProcessGroupAlive(processGroupId));
-        processGone = !processAlive;
-      }
+      processGone = (await classifyRunProcessLiveness(run)) === "dead";
     }
 
     // A result-less native run may intentionally have no live provider process
