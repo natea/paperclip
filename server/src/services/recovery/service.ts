@@ -362,6 +362,22 @@ function isTerminalIssueRun(latestRun: LatestIssueRun) {
 
 const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "adapter_failed",
+  // AND-17: a server restart (dev-watch reload or an operator stop) interrupts
+  // every in-flight run with this code. It describes the scheduler, not the
+  // issue, so it must retry with backoff like other transient infra. Without
+  // this entry it fell through to the `default` branch -- 1 attempt, no
+  // backoff -- and the next sweep demoted the issue to `blocked` with an empty
+  // `blockedBy`, which is what stranded AND-14 and AND-17 themselves.
+  "server_shutdown_interrupted",
+  // AND-17: the same restart also reaches a run through the adapter, as
+  // `process_signal_terminated` -- the OS killed the provider process (exit
+  // 143). Demoting the issue to `blocked` for it invents a blocker that has no
+  // `blockedBy` and no owner.
+  //
+  // `process_lost` deliberately stays out. It is the signal the stranded-recovery
+  // paths are built on ("live execution disappeared"), and reclassifying it as
+  // transient suppresses the escalation those paths owe the board.
+  "process_signal_terminated",
   "codex_transient_upstream",
   "codex_harness_crash",
   "claude_transient_upstream",
