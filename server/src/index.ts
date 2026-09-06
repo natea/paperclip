@@ -35,6 +35,7 @@ import detectPort from "detect-port";
 import { createApp } from "./app.js";
 import { loadConfig } from "./config.js";
 import { reportDevWatchStaleness } from "./dev-watch-staleness.js";
+import { primeServerInfoBootStamp } from "./server-info.js";
 import { logger } from "./middleware/logger.js";
 import {
   StartupRefusalError,
@@ -166,6 +167,11 @@ export async function startServer(): Promise<StartedServer> {
   // dev-watch change keeps the old behaviour indefinitely. Say so at boot
   // rather than letting a stale wrapper silently interrupt agent runs.
   reportDevWatchStaleness((payload, message) => logger.warn(payload, message));
+  // AND-69: same class, one level down. Anchor the "what commit did this
+  // process load" stamp to boot now, so /health can report drift between the
+  // running code and the checkout instead of re-reading HEAD and always
+  // looking current.
+  primeServerInfoBootStamp();
 
   // Tracing must be active (or have failed and logged) before the first DB
   // connection or the HTTP server exists — see instrumentation.ts.

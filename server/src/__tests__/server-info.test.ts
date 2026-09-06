@@ -3,6 +3,7 @@ import {
   createServerInfoSnapshot,
   getServerInfoSnapshot,
   resetServerInfoCacheForTests,
+  type ServerGitInfo,
 } from "../server-info.js";
 
 function gitCommandFor(shortSha: string, subject: string): () => string {
@@ -41,6 +42,13 @@ describe("server info snapshot", () => {
           unstagedFileCount: 0,
           untrackedFileCount: 0,
         },
+      },
+      freshness: {
+        status: "current",
+        bootSha: "0123456789abcdef0123456789abcdef01234567",
+        bootHadLocalChanges: false,
+        headSha: "0123456789abcdef0123456789abcdef01234567",
+        behindByCommits: 0,
       },
     });
   });
@@ -138,6 +146,10 @@ describe("server info snapshot", () => {
         available: false,
         unavailableReason: "git_unavailable",
       },
+      freshness: {
+        status: "unknown",
+        reason: "git_unavailable_at_boot",
+      },
     });
   });
 
@@ -164,13 +176,39 @@ describe("server info snapshot", () => {
           unavailableReason: "git_status_unavailable",
         },
       },
+      freshness: {
+        status: "current",
+        bootSha: "0123456789abcdef0123456789abcdef01234567",
+        bootHadLocalChanges: null,
+        headSha: "0123456789abcdef0123456789abcdef01234567",
+        behindByCommits: 0,
+      },
     });
   });
 });
 
+function bootGitInfoFor(shortSha: string): ServerGitInfo {
+  return {
+    available: true,
+    fullSha: shortSha.padEnd(40, "0"),
+    shortSha,
+    branchName: "platform/run-lifecycle-stability",
+    subject: "boot",
+    committedAt: "2026-06-25T17:00:00-07:00",
+    localChanges: {
+      available: true,
+      hasLocalChanges: false,
+      stagedFileCount: 0,
+      unstagedFileCount: 0,
+      untrackedFileCount: 0,
+    },
+  };
+}
+
 describe("getServerInfoSnapshot", () => {
   beforeEach(() => {
-    resetServerInfoCacheForTests();
+    // Pin the boot stamp so these cases never shell out to the real repository.
+    resetServerInfoCacheForTests({ bootGit: bootGitInfoFor("aaaaaaa") });
   });
 
   it("re-reads the running commit after the cache TTL expires", () => {
@@ -199,5 +237,106 @@ describe("getServerInfoSnapshot", () => {
     const first = getServerInfoSnapshot({ now: 0, gitCommand: gitCommandFor("aaaaaaa", "a") });
     const second = getServerInfoSnapshot({ now: 5000, gitCommand: gitCommandFor("bbbbbbb", "b") });
     expect(second.processStartedAt).toBe(first.processStartedAt);
+  });
+});
+
+// AND-69: `git` on the snapshot is re-read live, so it always reports the
+// checkout and can never say the running process has fallen behind it. These
+// cases pin the boot-anchored verdict that can.
+describe("runtime freshness (AND-69)", () => {
+  it("reports current while the checkout has not moved since boot", () => {
+    resetServerInfoCacheForTests({ bootGit: bootGitInfoFor("aaaaaaa") });
+
+    const snapshot = getServerInfoSnapshot({
+      now: 0,
+      gitCommand: gitCommandFor("aaaaaaa", "same commit"),
+      gitCountCommand: () => "0\n",
+    });
+
+    expect(snapshot.freshness).toEqual({
+      status: "current",
+      bootSha: "aaaaaaa".padEnd(40, "0"),
+      bootHadLocalChanges: false,
+      headSha: "aaaaaaa".padEnd(40, "0"),
+      behindByCommits: 0,
+    });
+  });
+
+  it("reports behind, with the distance, once the checkout advances past the loaded code", () => {
+    resetServerInfoCacheForTests({ bootGit: bootGitInfoFor("aaaaaaa") });
+
+    const snapshot = getServerInfoSnapshot({
+      now: 0,
+      gitCommand: gitCommandFor("bbbbbbb", "seven commits later"),
+      gitCountCommand: () => "7\n",
+    });
+
+    expect(snapshot.freshness).toEqual({
+      status: "behind",
+      bootSha: "aaaaaaa".padEnd(40, "0"),
+      bootHadLocalChanges: false,
+      headSha: "bbbbbbb".padEnd(40, "0"),
+      behindByCommits: 7,
+    });
+  });
+
+  it("still reports behind when the distance cannot be counted", () => {
+    resetServerInfoCacheForTests({ bootGit: bootGitInfoFor("aaaaaaa") });
+
+    const snapshot = getServerInfoSnapshot({
+      now: 0,
+      gitCommand: gitCommandFor("bbbbbbb", "history rewritten"),
+      gitCountCommand: () => {
+        throw new Error("fatal: bad revision");
+      },
+    });
+
+    expect(snapshot.freshness).toMatchObject({ status: "behind", behindByCommits: null });
+  });
+
+  it("flags a dirty boot so `current` is not read as a claim about uncommitted code", () => {
+    // The live case this was filed from: the AND-58 fix was loaded from a dirty
+    // working tree 78 seconds before it was committed, so no commit SHA could
+    // have described what the process was actually running.
+    const dirtyBoot = bootGitInfoFor("aaaaaaa");
+    resetServerInfoCacheForTests({
+      bootGit: {
+        ...dirtyBoot,
+        localChanges: {
+          available: true,
+          hasLocalChanges: true,
+          stagedFileCount: 0,
+          unstagedFileCount: 1,
+          untrackedFileCount: 0,
+        },
+      } as ServerGitInfo,
+    });
+
+    const snapshot = getServerInfoSnapshot({
+      now: 0,
+      gitCommand: gitCommandFor("aaaaaaa", "same commit"),
+      gitCountCommand: () => "0\n",
+    });
+
+    expect(snapshot.freshness).toMatchObject({
+      status: "current",
+      bootHadLocalChanges: true,
+    });
+  });
+
+  it("cannot decide drift when git is unavailable at boot", () => {
+    resetServerInfoCacheForTests({
+      bootGit: { available: false, unavailableReason: "git_unavailable" },
+    });
+
+    const snapshot = getServerInfoSnapshot({
+      now: 0,
+      gitCommand: gitCommandFor("bbbbbbb", "head is readable"),
+    });
+
+    expect(snapshot.freshness).toEqual({
+      status: "unknown",
+      reason: "git_unavailable_at_boot",
+    });
   });
 });
