@@ -69,6 +69,11 @@ import {
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
+import {
+  buildExecutionLockLossEvent,
+  ExecutionLockLossLogGate,
+  type ExecutionLockLossInput,
+} from "./execution-lock-observability.js";
 import { parseObject } from "../adapters/utils.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
@@ -136,6 +141,19 @@ import {
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+
+const executionLockLossGate = new ExecutionLockLossLogGate();
+
+/**
+ * AND-50: emit exactly one warning per distinct execution-lock loss. The
+ * symptom is a whole turn of refusals; the diagnosis is this single line.
+ */
+export function logExecutionLockLoss(input: ExecutionLockLossInput) {
+  const event = buildExecutionLockLossEvent(input);
+  if (!executionLockLossGate.shouldLog(event)) return;
+  logger.warn(event, "issue execution lock lost");
+}
+
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -5428,7 +5446,14 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({
+          executionRunId: issues.executionRunId,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionLockedAt: issues.executionLockedAt,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5461,6 +5486,23 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
+      // AND-50: the moment the execution lock leaves a run. Without this the
+      // displaced run just starts collecting refusals with nothing naming why.
+      if (updated) {
+        logExecutionLockLoss({
+          cause: "terminal_run_swept",
+          issueId,
+          companyId: issue.companyId,
+          identifier: issue.identifier,
+          issueStatus: issue.status,
+          assigneeAgentId: issue.assigneeAgentId,
+          priorRunId: issue.executionRunId,
+          priorRunStatus: run?.status ?? "missing",
+          lockedAt: issue.executionLockedAt,
+          detail: "execution lock cleared because its holder run is terminal or missing",
+        });
+      }
+
       return Boolean(updated);
     });
   }
@@ -5476,7 +5518,15 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionLockedAt: issues.executionLockedAt,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5524,6 +5574,22 @@ export function issueService(db: Db) {
         )
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
+
+      if (updated) {
+        logExecutionLockLoss({
+          cause: "terminal_run_swept",
+          issueId,
+          companyId: issue.companyId,
+          identifier: issue.identifier,
+          issueStatus: issue.status,
+          assigneeAgentId: issue.assigneeAgentId,
+          priorRunId: issue.checkoutRunId,
+          priorRunStatus: run?.status ?? "missing",
+          currentExecutionRunId: issue.executionRunId,
+          lockedAt: issue.executionLockedAt,
+          detail: "checkout lock cleared because its holder run is terminal or missing",
+        });
+      }
 
       return Boolean(updated);
     });
@@ -8653,24 +8719,27 @@ export function issueService(db: Db) {
       if (!latest) throw notFound("Issue not found");
       const resolvedLatest = await resolveOwnership(latest);
       if (resolvedLatest.ownership) return resolvedLatest.ownership;
-      if (resolvedLatest.latest) {
-        throw conflict("Issue run ownership conflict", {
-          issueId: resolvedLatest.latest.id,
-          status: resolvedLatest.latest.status,
-          assigneeAgentId: resolvedLatest.latest.assigneeAgentId,
-          checkoutRunId: resolvedLatest.latest.checkoutRunId,
-          executionRunId: resolvedLatest.latest.executionRunId,
-          actorAgentId,
-          actorRunId,
-        });
-      }
-
+      const denied = resolvedLatest.latest ?? latest;
+      // AND-50: the run asked to write and does not hold the lock. Name the
+      // loss here so the refusal stream that follows has a documented origin.
+      logExecutionLockLoss({
+        cause: "ownership_conflict",
+        issueId: denied.id,
+        issueStatus: denied.status,
+        assigneeAgentId: denied.assigneeAgentId,
+        priorRunId: actorRunId,
+        currentCheckoutRunId: denied.checkoutRunId,
+        currentExecutionRunId: denied.executionRunId,
+        actorAgentId,
+        actorRunId,
+        detail: "actor run no longer holds the issue checkout/execution lock",
+      });
       throw conflict("Issue run ownership conflict", {
-        issueId: latest.id,
-        status: latest.status,
-        assigneeAgentId: latest.assigneeAgentId,
-        checkoutRunId: latest.checkoutRunId,
-        executionRunId: latest.executionRunId,
+        issueId: denied.id,
+        status: denied.status,
+        assigneeAgentId: denied.assigneeAgentId,
+        checkoutRunId: denied.checkoutRunId,
+        executionRunId: denied.executionRunId,
         actorAgentId,
         actorRunId,
       });

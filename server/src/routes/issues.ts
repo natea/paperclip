@@ -207,6 +207,7 @@ import {
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  logExecutionLockLoss,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -4288,6 +4289,21 @@ export function issueRoutes(
         // denial copy below promises the lock "clears on its own".
         const heldRunLocks = await svc.releaseTerminalRunLocks(issue.id);
         if (heldRunLocks.checkoutRunId || heldRunLocks.executionRunId) {
+          // AND-50: a non-assignee actor refused by a live lock is the other
+          // face of silent lock loss — record who holds it and who was refused.
+          logExecutionLockLoss({
+            cause: "non_assignee_run_lock",
+            issueId: issue.id,
+            companyId: issue.companyId,
+            identifier: issue.identifier ?? null,
+            issueStatus: issue.status,
+            assigneeAgentId: issue.assigneeAgentId,
+            currentCheckoutRunId: heldRunLocks.checkoutRunId,
+            currentExecutionRunId: heldRunLocks.executionRunId,
+            actorAgentId,
+            actorRunId: req.actor.runId ?? null,
+            detail: "non-assignee write refused while a live run holds the issue lock",
+          });
           // Run/checkout ownership stays assignee-scoped even though writes are
           // open, so this lock clears on its own — the copy routes to comments.
           return denyIssueWrite(req, res, issue, "issue_write_assignee_run_lock", {
