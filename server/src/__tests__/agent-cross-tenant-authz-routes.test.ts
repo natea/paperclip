@@ -770,11 +770,14 @@ describe.sequential("agent cross-tenant route authorization", () => {
     expect(mockLogActivity).not.toHaveBeenCalled();
   });
 
-  it("returns a clear 409 for non-error agents", async () => {
+  it("still surfaces a service conflict for a terminated agent", async () => {
+    // AND-47 narrowed the 409s clearError raises -- a non-error live status is
+    // now an idempotent 200 -- but a terminal agent still conflicts, and the
+    // route has to pass that through rather than swallow it.
     const { conflict } = await import("../errors.js");
-    mockAgentService.getById.mockImplementation(async () => ({ ...baseAgent, status: "idle" }));
+    mockAgentService.getById.mockImplementation(async () => ({ ...baseAgent, status: "terminated" }));
     mockAgentService.clearError.mockImplementation(async () => {
-      throw conflict("Only agents in error status can have their error cleared");
+      throw conflict("Cannot clear error on terminated agent");
     });
     const app = await createApp({
       type: "board",
@@ -789,7 +792,37 @@ describe.sequential("agent cross-tenant route authorization", () => {
     );
 
     expect(res.status).toBe(409);
-    expect(res.body.error).toBe("Only agents in error status can have their error cleared");
+    expect(res.body.error).toBe("Cannot clear error on terminated agent");
     expect(mockLogActivity).not.toHaveBeenCalled();
+  });
+
+  it("logs the recovery for an idempotent clear on an already-healthy agent", async () => {
+    // AND-47: the auto-retry beat the manager to it. The clear is a no-op on
+    // status, but the attempt is still audit-worthy -- a manager did act.
+    mockAgentService.getById.mockImplementation(async () => ({ ...baseAgent, status: "running" }));
+    mockAgentService.clearError.mockResolvedValue({
+      ...baseAgent,
+      status: "running",
+      errorReason: null,
+    });
+    const app = await createApp({
+      type: "board",
+      userId: "board-user",
+      companyIds: [companyId],
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/clear-error`).send({}),
+    );
+
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: "running", errorReason: null });
+    expect(mockAgentService.clearError).toHaveBeenCalledWith(agentId);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ action: "agent.error_cleared" }),
+    );
   });
 });
