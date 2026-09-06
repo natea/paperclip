@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { classifyIssueGraphLiveness } from "../services/issue-liveness.ts";
+import {
+  classifyIssueReviewPaths,
+  hasScheduledIssueMonitorPath,
+} from "../services/recovery/issue-graph-liveness.ts";
 
 const companyId = "company-1";
 const managerId = "manager-1";
@@ -598,6 +602,85 @@ describe("issue graph liveness classifier", () => {
       issueId: reviewIssueId,
       state: "in_review_without_action_path",
       recoveryIssueId: reviewIssueId,
+    });
+  });
+
+  describe("scheduled issue monitor path (AND-50)", () => {
+    // tickDueIssueMonitors only claims rows with `assigneeUserId is null` and
+    // `assigneeAgentId is not null` in status in_progress/in_review. A monitor outside that
+    // predicate is never dispatched, so it is not a wake path.
+    const now = new Date("2026-09-06T00:00:00.000Z");
+    const futureCheck = new Date("2026-09-06T01:00:00.000Z");
+
+    const monitored = (overrides: Record<string, unknown> = {}) =>
+      issue({
+        id: "review-1",
+        identifier: "PAP-2279",
+        title: "Screenshot acceptance review",
+        status: "in_review",
+        assigneeAgentId: coderId,
+        executionState: null,
+        monitorNextCheckAt: futureCheck,
+        ...overrides,
+      });
+
+    it("agrees with the scheduler on assignment eligibility", () => {
+      expect(hasScheduledIssueMonitorPath(monitored(), now)).toBe(true);
+      expect(hasScheduledIssueMonitorPath(monitored({ assigneeAgentId: null }), now)).toBe(false);
+      expect(
+        hasScheduledIssueMonitorPath(monitored({ assigneeUserId: "board-user-1" }), now),
+      ).toBe(false);
+      expect(hasScheduledIssueMonitorPath(monitored({ status: "in_progress" }), now)).toBe(true);
+      expect(hasScheduledIssueMonitorPath(monitored({ status: "todo" }), now)).toBe(false);
+      expect(hasScheduledIssueMonitorPath(monitored({ status: "blocked" }), now)).toBe(false);
+    });
+
+    it("classifies an unassigned in_review issue with a future monitor check as having no action path", () => {
+      const unassigned = monitored({ assigneeAgentId: null, assigneeUserId: null });
+      const input = { now, issues: [unassigned], relations: [], agents: [agent(), manager] };
+
+      expect(classifyIssueReviewPaths(input, unassigned)).toEqual([]);
+    });
+
+    it("still reports a monitor review path when the scheduler would claim the row", () => {
+      const assigned = monitored();
+      const input = { now, issues: [assigned], relations: [], agents: [agent(), manager] };
+
+      expect(classifyIssueReviewPaths(input, assigned)).toContainEqual(
+        expect.objectContaining({ kind: "monitor", agentId: coderId }),
+      );
+      expect(
+        classifyIssueGraphLiveness({ ...input, agents: [agent(), manager] }),
+      ).toEqual([]);
+    });
+
+    it("does not let an unschedulable monitor suppress a stalled backlog blocker", () => {
+      const parkedBlockerId = "parked-blocker-1";
+      const withMonitor = (overrides: Record<string, unknown>) =>
+        classifyIssueGraphLiveness({
+          now,
+          issues: [
+            issue(),
+            issue({
+              id: parkedBlockerId,
+              identifier: "PAP-2280",
+              title: "Parked blocker",
+              status: "backlog",
+              assigneeAgentId: coderId,
+              monitorNextCheckAt: futureCheck,
+              ...overrides,
+            }),
+          ],
+          relations: blocks.map((relation) => ({ ...relation, blockerIssueId: parkedBlockerId })),
+          agents: [agent(), manager],
+        });
+
+      // backlog is outside the scheduler's status predicate: the monitor never fires.
+      expect(withMonitor({})).toMatchObject([
+        { issueId: blockedId, state: "blocked_by_assigned_backlog_issue", recoveryIssueId: parkedBlockerId },
+      ]);
+      // in_progress is inside it, so the same monitor is a real wake path.
+      expect(withMonitor({ status: "in_progress" })).toEqual([]);
     });
   });
 

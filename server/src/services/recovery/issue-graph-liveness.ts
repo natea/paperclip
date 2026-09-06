@@ -191,7 +191,19 @@ function monitorFromIssue(issue: IssueLivenessIssueInput) {
   return { policyMonitor, stateMonitor };
 }
 
+// Mirrors the row predicate `tickDueIssueMonitors` selects on (heartbeat.ts). A monitor the
+// scheduler will never claim is not a wake path, however healthy its schedule looks.
+const SCHEDULABLE_MONITOR_STATUSES = new Set(["in_progress", "in_review"]);
+
+export function isSchedulableIssueMonitorAssignment(issue: IssueLivenessIssueInput) {
+  if (issue.assigneeUserId) return false;
+  if (!issue.assigneeAgentId) return false;
+  return SCHEDULABLE_MONITOR_STATUSES.has(issue.status);
+}
+
 export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now: Date | string | number) {
+  if (!isSchedulableIssueMonitorAssignment(issue)) return false;
+
   const nowMs = typeof now === "number" ? now : readDateMs(now) ?? Date.now();
   const nextCheckAtMs = readDateMs(issue.monitorNextCheckAt);
   if (nextCheckAtMs === null || nextCheckAtMs <= nowMs) return false;
