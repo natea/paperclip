@@ -2183,7 +2183,7 @@ registry.registerPath({
   tags: ["agents"],
   summary: "Clear an agent error",
   description:
-    "Returns an agent from `error` to `idle` and clears its `errorReason`. The board may clear any agent in the company; an agent caller needs `agents:configure` change-grant authority over the target, which is how a manager recovers its own report. `POST /api/agents/{id}/resume` has the same effect and the same agent-side authority check.",
+    "Returns an agent from `error` to `idle` and clears its `errorReason`. Idempotent on any other live status (AND-47): if a retry or an adoption already moved the agent out of `error`, this clears the leftover `errorReason` and returns 200 without changing `status`, so recovering a report never loses a race with the auto-retry. Still 409 for `terminated` and `pending_approval`. The board may clear any agent in the company; an agent caller needs `agents:configure` change-grant authority over the target, which is how a manager recovers its own report. `POST /api/agents/{id}/resume` has the same effect and the same agent-side authority check.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });

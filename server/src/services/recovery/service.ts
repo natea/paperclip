@@ -1492,6 +1492,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       .update(agents)
       .set({
         status: nextStatus,
+        // AND-47: adoption is a transition out of `error` too. Clear the stale
+        // reason on the same write that moves the agent back to healthy,
+        // exactly as finalizeAgentStatus does; keep it when we land in `error`.
+        ...(nextStatus === "error" ? {} : { errorReason: null }),
         lastHeartbeatAt: new Date(),
         updatedAt: new Date(),
       })
