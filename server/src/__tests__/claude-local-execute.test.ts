@@ -5,12 +5,12 @@ import path from "node:path";
 import type { AdapterRuntimeMcpServer } from "@paperclipai/adapter-utils";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import {
-import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
   claudeCommandSupportsEffortFlag,
   claudeSessionCwdMatchesExecutionTarget,
   execute,
   resetClaudeCliCapabilitiesCacheForTests,
 } from "@paperclipai/adapter-claude-local/server";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 async function writeFailingClaudeCommand(
   commandPath: string,
