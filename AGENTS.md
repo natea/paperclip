@@ -162,17 +162,73 @@ pnpm test:release-smoke
 
 Run the browser suites only when your change touches them or when you are explicitly verifying CI/release flows.
 
-For normal issue work, run the smallest relevant verification first. Do not default to repo-wide typecheck/build/test on every heartbeat when a narrower check is enough to prove the change.
+### The standard bar: a scoped suite
 
-Run this full check before claiming repo work done in a PR-ready hand-off, or when the change scope is broad enough that targeted checks are not sufficient:
+For normal issue work, run the smallest relevant verification first, scoped to what
+the change touches:
+
+```sh
+pnpm exec vitest run <the suite(s) your change affects>
+```
+
+This is the bar a heartbeat is expected to clear. Do not default to repo-wide
+typecheck/build/test on every heartbeat when a narrower check is enough to prove
+the change.
+
+### The full gate is out-of-band
+
+The full gate is not a heartbeat-sized check. The server vitest config pins
+`maxWorkers: 1`, and 202 server suites each boot their own embedded Postgres and
+run the whole migration chain, so a serial `pnpm test:run` is a ~20 minute job.
+CI does not pay that serially — it fans the lanes across matrix jobs with
+`--shard-index/--shard-count`.
+
+Locally, use the parallel driver, which spawns those same CI lanes concurrently:
+
+```sh
+pnpm test:run:local            # defaults to min(4, cores/2) concurrent lanes
+pnpm test:run:local -- --jobs 6
+```
+
+It prints a per-lane pass/fail summary with wall times and the exact
+`run-vitest-stable.mjs` command to re-run any failing lane on its own.
+`pnpm test:run` still works and is the serial equivalent.
+
+Run the full check before claiming repo work done in a PR-ready hand-off, or when
+the change scope is broad enough that targeted checks are not sufficient:
 
 ```sh
 pnpm -r typecheck
-pnpm test:run
+pnpm test:run:local
 pnpm build
 ```
 
 If anything cannot be run, explicitly report what was not run and why.
+
+### Never invoke the gate as a bare `vitest run`
+
+Always go through `pnpm test:run` / `pnpm test:run:local`. Both mint a fresh
+`TMPDIR` and `PAPERCLIP_HOME` under `/tmp` for every Vitest invocation.
+
+A bare `vitest run` from `server/` inherits the caller's `TMPDIR`. Inside a
+Paperclip heartbeat that is `PAPERCLIP_RUN_SCRATCH_DIR`, which the runtime
+deletes when the launching run ends — taking the Vite SSR transform cache and
+every embedded Postgres data directory with it. The gate then reports hundreds
+of suites failing at collection with `ENOENT ... /ssr/<hash>`, plus Postgres
+`58P01 could not open file` and `ECONNRESET` in whatever was mid-flight. That
+looks like a catastrophic regression and is purely an artifact of the launch.
+This is the concrete form of the standing rule: do not launch verification that
+cannot outlive the heartbeat that launched it.
+
+### Comparing filesystem paths in tests
+
+On macOS `os.tmpdir()` returns `/var/folders/...`, a symlink to
+`/private/var/folders/...`. `path.resolve`/`path.join` do not follow symlinks,
+but runtime code that realpaths its roots returns the `/private` form, so a raw
+`mkdtemp` path compared against a runtime path can never match on a Mac.
+Normalize temp roots with `fs.realpath` at creation (see `makeTempDir` in
+`server/src/__tests__/workspace-runtime.test.ts`) so every derived path is
+already in realpath form, or realpath both sides of the comparison.
 
 ## 8. API and Auth Expectations
 
