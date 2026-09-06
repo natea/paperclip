@@ -77,3 +77,6 @@ tests/storybook-visual/playwright-report/
 .vercel/
 .env.local
 test-results/
+
+# Stray artifact from the Excalidraw dev surface; never part of a build.
+excalidraw.log
