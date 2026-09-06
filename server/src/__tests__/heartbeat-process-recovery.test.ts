@@ -113,6 +113,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   heartbeatService,
+  persistHeartbeatRunProcessMetadata,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
@@ -1673,6 +1674,186 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await fs.rm(home, { recursive: true, force: true });
     }
   }
+
+  it("records the spawn lane on the run and merges it into the existing context snapshot", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running" });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: 4321,
+      processGroupId: 4321,
+      startedAt: "2026-03-19T00:01:00.000Z",
+      executionEngine: "cli",
+      processTopology: "detached",
+    });
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(run?.processPid).toBe(4321);
+    expect(run?.contextSnapshot).toMatchObject({
+      executionEngine: "cli",
+      processTopology: "detached",
+    });
+    // The merge must not clobber keys other paths wrote on this same row.
+    expect(
+      (run?.contextSnapshot as Record<string, unknown>).issueId,
+    ).toEqual(expect.any(String));
+  });
+
+  it("leaves the spawn lane unset when the adapter does not report one", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running" });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: 4322,
+      processGroupId: null,
+      startedAt: "2026-03-19T00:01:00.000Z",
+    });
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    const context = run?.contextSnapshot as Record<string, unknown>;
+
+    expect(context.executionEngine).toBeUndefined();
+    expect(context.processTopology).toBeUndefined();
+    expect(context.issueId).toEqual(expect.any(String));
+  });
+
+  it("adopts a detached CLI run whose lane was recorded by the spawn site", async () => {
+    // Regression: the lane fields were only ever read, never written, so a
+    // detached CLI run fell through to the adapterType fallback and was drained
+    // as if it were bound to this server's stdio. Drive the real writer here
+    // rather than hand-seeding the snapshot, which is what hid the defect.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+    });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: child.pid ?? 0,
+      processGroupId: child.pid ?? 0,
+      startedAt: "2026-03-19T00:01:00.000Z",
+      executionEngine: "cli",
+      processTopology: "detached",
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const result = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result.mode).toBe("hot_restart");
+      expect(result.skipDrain).toBe(true);
+      expect(isPidAlive(child.pid)).toBe(true);
+    });
+  });
+
+  it("drains an ACP run whose lane was recorded by the spawn site", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+    });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: child.pid ?? 0,
+      processGroupId: null,
+      startedAt: "2026-03-19T00:01:00.000Z",
+      executionEngine: "acp",
+      processTopology: "server_stdio",
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const result = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result.mode).toBe("acp_drain_required");
+      expect(result.skipDrain).toBe(false);
+      expect(result.drainRunIds).toEqual([runId]);
+    });
+  });
+
+  it("adopts a legacy claude_local run with no recorded lane that is its own process-group leader", async () => {
+    // Legacy rows predate the spawn sites recording a lane, and adapterConfig
+    // has no `engine` key by default. The observed process shape -- pid equal
+    // to its own process-group id -- is the recorded fact that keeps these
+    // runs from being drained during the rollout.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: child.pid ?? null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const result = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result.mode).toBe("hot_restart");
+      expect(result.activeRunIds).toEqual([runId]);
+      expect(isPidAlive(child.pid)).toBe(true);
+    });
+  });
+
+  it("still drains a legacy claude_local run with no recorded lane and no usable process group", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const result = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result.mode).toBe("acp_drain_required");
+      expect(result.drainRunIds).toEqual([runId]);
+    });
+  });
 
   it("captures a hot-restart shutdown snapshot without interrupting running runs", async () => {
     const child = spawnAliveProcess();

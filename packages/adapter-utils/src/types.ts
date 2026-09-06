@@ -187,6 +187,43 @@ export interface AdapterRuntimeEvent {
   payload?: Record<string, unknown>;
 }
 
+/**
+ * Which execution lane an adapter actually selected for a run. Recorded at the
+ * spawn site, where the lane is a fact rather than something to re-derive from
+ * adapter config that does not determine it.
+ *
+ * - `cli` runs the provider's own CLI as a detached child process group. The
+ *   control channel is the child's own stdio, so the run outlives a server
+ *   restart and can be adopted.
+ * - `acp` drives the provider over the ACP protocol on a channel owned by the
+ *   server process. The run dies with the server and must be drained, not
+ *   adopted.
+ */
+export type RunExecutionEngine = "cli" | "acp";
+
+/**
+ * How the spawned process is attached to the server process.
+ *
+ * - `detached` is its own process-group leader and survives a server restart.
+ * - `server_stdio` is bound to the server's lifetime, whether because its
+ *   control channel is server-owned stdio or because it was not detached.
+ */
+export type RunProcessTopology = "detached" | "server_stdio";
+
+/**
+ * Reported by the spawn site to the server when a run's process starts. The
+ * lane fields are optional so adapters that do not spawn a local process (and
+ * older adapter builds) keep compiling; the server treats an absent lane as
+ * "unknown" and falls back to the observed process shape.
+ */
+export interface RunProcessSpawnMeta {
+  pid: number;
+  processGroupId: number | null;
+  startedAt: string;
+  executionEngine?: RunExecutionEngine;
+  processTopology?: RunProcessTopology;
+}
+
 export interface AdapterExecutionContext {
   runId: string;
   agent: AdapterAgent;
@@ -215,7 +252,7 @@ export interface AdapterExecutionContext {
    * remote operation.
    */
   onDispatch?: () => void;
-  onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
+  onSpawn?: (meta: RunProcessSpawnMeta) => Promise<void>;
   authToken?: string;
   /**
    * The injected OpenTelemetry startup trace context (tracer + root

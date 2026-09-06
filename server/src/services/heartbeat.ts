@@ -389,6 +389,8 @@ import {
   hasSessionCompactionThresholds,
   resolvePaperclipRunnerIdleTimeoutMs,
   resolveSessionCompactionPolicy,
+  type RunExecutionEngine,
+  type RunProcessTopology,
   type RuntimeStatusUpdate,
   type SessionCompactionPolicy,
 } from "@paperclipai/adapter-utils";
@@ -7667,9 +7669,22 @@ function isProcessAlive(pid: number | null | undefined) {
 export async function persistHeartbeatRunProcessMetadata(
   db: Db,
   runId: string,
-  meta: { pid: number; processGroupId: number | null; startedAt: string },
+  meta: {
+    pid: number;
+    processGroupId: number | null;
+    startedAt: string;
+    executionEngine?: RunExecutionEngine;
+    processTopology?: RunProcessTopology;
+  },
 ) {
   const startedAt = new Date(meta.startedAt);
+  // The spawn site knows which lane it selected; record it as a fact on the run
+  // so restart handling reads it back instead of re-deriving the lane from
+  // adapter config that does not determine it. Adapters that do not report a
+  // lane leave the keys absent, and readers fall back to the observed shape.
+  const lane: Record<string, string> = {};
+  if (meta.executionEngine) lane.executionEngine = meta.executionEngine;
+  if (meta.processTopology) lane.processTopology = meta.processTopology;
   return db
     .update(heartbeatRuns)
     .set({
@@ -7678,6 +7693,13 @@ export async function persistHeartbeatRunProcessMetadata(
       processStartedAt: Number.isNaN(startedAt.getTime())
         ? new Date()
         : startedAt,
+      // Merge, never replace: contextSnapshot carries unrelated keys (issueId,
+      // wake provenance) written by other paths on this same row.
+      ...(Object.keys(lane).length > 0
+        ? {
+            contextSnapshot: sql`case when jsonb_typeof(${heartbeatRuns.contextSnapshot}) = 'object' then ${heartbeatRuns.contextSnapshot} else '{}'::jsonb end || ${JSON.stringify(lane)}::jsonb`,
+          }
+        : {}),
       updatedAt: new Date(),
     })
     .where(eq(heartbeatRuns.id, runId))
@@ -11641,7 +11663,13 @@ export function heartbeatService(
 
   async function persistRunProcessMetadata(
     runId: string,
-    meta: { pid: number; processGroupId: number | null; startedAt: string },
+    meta: {
+      pid: number;
+      processGroupId: number | null;
+      startedAt: string;
+      executionEngine?: RunExecutionEngine;
+      processTopology?: RunProcessTopology;
+    },
   ) {
     return persistHeartbeatRunProcessMetadata(db, runId, meta);
   }
@@ -12376,6 +12404,22 @@ export function heartbeatService(
     ) {
       return false;
     }
+    // No lane recorded on the run. Either this row predates the spawn sites
+    // recording one, or it came from a path that does not spawn a local
+    // process. Prefer the observed process shape over adapter config: a run
+    // whose pid is its own process-group leader was spawned detached and
+    // outlives this server. That is the same signal AND-18's dev-watch
+    // preservation gate keys on, so both restart paths now agree on which runs
+    // survive a restart.
+    const processPid = input.run.processPid ?? null;
+    const processGroupId = input.run.processGroupId ?? null;
+    if (
+      processPid !== null &&
+      processGroupId !== null &&
+      processPid === processGroupId
+    ) {
+      return false;
+    }
     if (
       !["claude_local", "codex_local", "gemini_local"].includes(
         input.adapterType,
@@ -12383,6 +12427,11 @@ export function heartbeatService(
     ) {
       return false;
     }
+    // Last resort for a legacy row with no recorded lane and no usable process
+    // group. `engine` does not determine the lane, so an unset value is
+    // unknown, not "acp" -- and draining a run that could have been adopted
+    // only costs an optimisation, while adopting a server-bound run loses it.
+    // Stay conservative here rather than flipping the default.
     return (
       readNonEmptyString(parseObject(input.adapterConfig).engine) !== "cli"
     );
@@ -20898,6 +20947,14 @@ export function heartbeatService(
                             ? meta.processGroupId
                             : null,
                         startedAt: meta.startedAt,
+                        executionEngine:
+                          "executionEngine" in meta
+                            ? meta.executionEngine
+                            : undefined,
+                        processTopology:
+                          "processTopology" in meta
+                            ? meta.processTopology
+                            : undefined,
                       });
                     },
                     authToken: authToken ?? undefined,
