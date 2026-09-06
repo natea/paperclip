@@ -9,12 +9,18 @@ const tsxCliPath = require.resolve("tsx/cli");
 const serverRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const ignoreArgs = resolveServerDevWatchIgnorePaths(serverRoot).flatMap((ignorePath) => ["--exclude", ignorePath]);
 
+// Marks the server as running under `tsx watch`, where a SIGTERM is a restart
+// rather than a shutdown. The server uses this to decide whether its graceful
+// drain should interrupt in-flight agent runs: under dev-watch every source
+// save would otherwise SIGTERM every agent run on the instance. Ctrl-C still
+// arrives as SIGINT and still drains normally, so this never keeps agent
+// processes alive past an operator-requested stop.
 const child = spawn(
   process.execPath,
   [tsxCliPath, "watch", ...ignoreArgs, "src/index.ts"],
   {
     cwd: serverRoot,
-    env: process.env,
+    env: { ...process.env, PAPERCLIP_DEV_WATCH: "1" },
     stdio: "inherit",
   },
 );

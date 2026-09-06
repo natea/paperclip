@@ -12823,7 +12823,12 @@ export function heartbeatService(
   ) {
     const selectedRunIds = runIds ? [...new Set(runIds)] : null;
     if (selectedRunIds?.length === 0) {
-      return { interrupted: 0, interruptedRunIds: [], retryRunIds: [] };
+      return {
+        interrupted: 0,
+        interruptedRunIds: [],
+        retryRunIds: [],
+        preservedRunIds: [],
+      };
     }
     const activeRuns = await db
       .select({
@@ -12843,8 +12848,48 @@ export function heartbeatService(
 
     const interruptedRunIds: string[] = [];
     const retryRunIds: string[] = [];
+    const preservedRunIds: string[] = [];
+    // Under `tsx watch` (server/scripts/dev-watch.ts) a SIGTERM is a restart,
+    // not a stop: every save to server/src restarts the server, and draining
+    // would SIGTERM every in-flight agent run on the instance -- including the
+    // run of the agent doing the editing. An operator stop still arrives as
+    // SIGINT on the foreground process group, so gate this on SIGTERM only.
+    const preserveDetachedRunsForDevRestart =
+      signal === "SIGTERM" && process.env.PAPERCLIP_DEV_WATCH === "1";
 
     for (const { run, agent } of activeRuns) {
+      // Only child processes that lead their own process group survive a
+      // restart; anything sharing the server's group dies with it anyway, so
+      // preserving it in the database would strand a `running` row. Boot
+      // reconciliation picks these up: a live pid keeps the run `running` with
+      // errorCode `process_detached` instead of failing or retrying it.
+      if (
+        preserveDetachedRunsForDevRestart &&
+        run.runtimeMode !== "native" &&
+        run.processPid !== null &&
+        run.processGroupId !== null &&
+        run.processPid === run.processGroupId &&
+        isProcessAlive(run.processPid)
+      ) {
+        runningProcesses.delete(run.id);
+        preservedRunIds.push(run.id);
+        await appendRunEvent(run, {
+          eventType: "lifecycle",
+          stream: "system",
+          level: "warn",
+          message:
+            `Left running across a dev-watch server restart (${signal}); `
+            + "the agent process was not signalled",
+          payload: {
+            signal,
+            processPid: run.processPid,
+            processGroupId: run.processGroupId,
+            devWatchRestart: true,
+          },
+        });
+        continue;
+      }
+
       const message = `Interrupted by graceful server shutdown (${signal}); retry queued for restart recovery`;
       const running = runningProcesses.get(run.id);
       try {
@@ -12935,6 +12980,13 @@ export function heartbeatService(
       interruptedRunIds.push(interrupted.id);
     }
 
+    if (preservedRunIds.length > 0) {
+      logger.warn(
+        { signal, preserved: preservedRunIds.length, preservedRunIds },
+        "left detached agent runs alive across a dev-watch server restart",
+      );
+    }
+
     if (interruptedRunIds.length > 0) {
       logger.warn(
         {
@@ -12951,6 +13003,7 @@ export function heartbeatService(
       interrupted: interruptedRunIds.length,
       interruptedRunIds,
       retryRunIds,
+      preservedRunIds,
     };
   }
 

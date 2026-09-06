@@ -2477,6 +2477,117 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.executionRunId).toBe(retryRun?.id);
   });
 
+  async function spawnDetachedGroupLeader() {
+    const child = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { detached: true, stdio: "ignore" },
+    );
+    child.unref();
+    const pid = child.pid ?? null;
+    if (!pid) throw new Error("failed to spawn detached process group leader");
+    cleanupPids.add(pid);
+    // A detached child leads its own process group, so pid === pgid. That is
+    // the shape the dev-watch preservation gate keys on.
+    return pid;
+  }
+
+  it.skipIf(process.platform === "win32")(
+    "leaves detached agent runs alive when a dev-watch restart SIGTERMs the server",
+    async () => {
+      const pid = await spawnDetachedGroupLeader();
+      const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: pid,
+        processGroupId: pid,
+      });
+      const heartbeat = heartbeatService(db);
+
+      vi.stubEnv("PAPERCLIP_DEV_WATCH", "1");
+      try {
+        const result = await heartbeat.drainRunningRunsForShutdown(
+          "SIGTERM",
+          new Date("2026-03-19T00:06:00.000Z"),
+        );
+        expect(result.interrupted).toBe(0);
+        expect(result.preservedRunIds).toEqual([runId]);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+
+      expect(isPidAlive(pid)).toBe(true);
+
+      // No interrupt, no retry run, and the issue keeps its checkout: the run
+      // is still live and will be reconciled by the next server boot.
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ id: runId, status: "running" });
+
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.status).toBe("claimed");
+
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue?.checkoutRunId).toBe(runId);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still drains detached agent runs on an operator SIGINT under dev-watch",
+    async () => {
+      const pid = await spawnDetachedGroupLeader();
+      const { runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: pid,
+        processGroupId: pid,
+      });
+      const heartbeat = heartbeatService(db);
+
+      vi.stubEnv("PAPERCLIP_DEV_WATCH", "1");
+      try {
+        const result = await heartbeat.drainRunningRunsForShutdown(
+          "SIGINT",
+          new Date("2026-03-19T00:06:00.000Z"),
+        );
+        expect(result.interrupted).toBe(1);
+        expect(result.interruptedRunIds).toEqual([runId]);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still drains agent runs on SIGTERM when the server is not under dev-watch",
+    async () => {
+      const pid = await spawnDetachedGroupLeader();
+      const { runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: pid,
+        processGroupId: pid,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.drainRunningRunsForShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+      expect(result.interrupted).toBe(1);
+      expect(result.interruptedRunIds).toEqual([runId]);
+    },
+  );
+
+
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
     const { runId, wakeupRequestId } = await seedRunFixture({
       agentStatus: "running",
