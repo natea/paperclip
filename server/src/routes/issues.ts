@@ -103,6 +103,7 @@ import {
   type SuggestTasksInteraction,
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
+  isIssueWriteDenialCode,
   issueWriteDenialCodeForResponsibleUserDenial,
   issueWriteDenialResponse,
   type IssueWriteDenialCode,
@@ -265,6 +266,10 @@ import {
   observeCrossIssueInfluence,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
+import {
+  recordIssueWriteDenial,
+  type IssueWriteChannel,
+} from "../services/issue-write-denial-record.js";
 import {
   getNativeSessionSteeringState,
   NativeSessionSteeringError,
@@ -3025,6 +3030,13 @@ export function issueRoutes(
     return resolveActorSourceTrustForIssue({ db, issue, actor });
   }
 
+  /** Pull the machine-readable denial code back off a thrown `HttpError`. */
+  function issueWriteDenialCodeFromThrown(err: unknown): IssueWriteDenialCode | null {
+    const details = (err as { details?: unknown } | null)?.details;
+    const code = (details as { code?: unknown } | null)?.code;
+    return typeof code === "string" && isIssueWriteDenialCode(code) ? code : null;
+  }
+
   async function assertCrossIssueInfluenceWithinRunCap(
     req: Request,
     res: Response,
@@ -3032,25 +3044,64 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
-    if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError();
+    if (!req.actor.agentId || !req.actor.runId) {
+      // AND-29: this is the AND-16/AND-23 shape -- the assignee's own comment
+      // refused on its own task because the run context did not resolve. It
+      // throws rather than returning, so without recording here the refusal
+      // leaves no trace at all and reads downstream as silence.
+      await recordIssueWriteDenial(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        agentId: req.actor.agentId ?? null,
+        code: "cross_issue_influence_run_context_required",
+        channel: kind,
+        carriedRunId: req.actor.runId ?? null,
+      });
+      throw crossIssueInfluenceRunContextError();
+    }
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
-    const decision = await observeCrossIssueInfluence(db, {
-      companyId: issue.companyId,
-      runId: req.actor.runId,
-      agentId: req.actor.agentId,
-      responsibleUserId: req.actor.onBehalfOfUserId ?? null,
-      targetIssueId: issue.id,
-      targetIssueIdentifier: issue.identifier ?? null,
-      kind,
-    });
+    let decision: Awaited<ReturnType<typeof observeCrossIssueInfluence>>;
+    try {
+      decision = await observeCrossIssueInfluence(db, {
+        companyId: issue.companyId,
+        runId: req.actor.runId,
+        agentId: req.actor.agentId,
+        responsibleUserId: req.actor.onBehalfOfUserId ?? null,
+        targetIssueId: issue.id,
+        targetIssueIdentifier: issue.identifier ?? null,
+        kind,
+      });
+    } catch (err) {
+      // AND-29: these throws are the AND-16/AND-23 cause -- a run id that does
+      // not resolve, or a run with no task bound, refusing the assignee on its
+      // own issue. Record the refusal on the way past so it is evidence rather
+      // than silence, then let the original error reach the error handler.
+      const deniedCode = issueWriteDenialCodeFromThrown(err);
+      if (deniedCode) {
+        await recordIssueWriteDenial(db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          agentId: req.actor.agentId,
+          code: deniedCode,
+          channel: kind,
+          carriedRunId: req.actor.runId,
+        });
+      }
+      throw err;
+    }
     if (!decision || decision.allowed) return true;
 
     const labels = await issueWriteDenialLabels(req, {
       identifier: issue.identifier ?? null,
       assigneeAgentId: null,
     });
+    // No `issue.write_denied` row here: `observeCrossIssueInfluence` already
+    // wrote `issue.cross_issue_influence_cap_rejected` for this same refusal,
+    // and a second row would double-count it in the activity feed. The cap only
+    // ever fires on a *cross*-issue write, so it is not the shape AND-29's
+    // no-comment-streak read cares about in the first place.
     res.status(429).json(crossIssueInfluenceLimitError(decision, {
       actorLabel: labels.actorLabel,
       issueIdentifier: labels.issueIdentifier,
@@ -4022,16 +4073,35 @@ export function issueRoutes(
     };
   }
 
-  /** Respond to a denied issue write with copy that names boundary, who, and path. */
+  /**
+   * Respond to a denied issue write with copy that names boundary, who, and path,
+   * and leave a durable trace of the refusal on the task.
+   *
+   * AND-29: the trace is the point. Productivity review's `no_comment_streak`
+   * counts *persisted* assignee comments, so before this every refusal here was
+   * invisible to it and an agent whose channel was closed scored exactly like an
+   * agent that never tried.
+   */
   async function denyIssueWrite(
     req: Request,
     res: Response,
-    issue: { identifier?: string | null; assigneeAgentId: string | null },
+    issue: { id?: string; companyId?: string; identifier?: string | null; assigneeAgentId: string | null },
     code: IssueWriteDenialCode,
     extraDetails: Record<string, unknown> = {},
+    channel: IssueWriteChannel = "update",
   ) {
     const labels = await issueWriteDenialLabels(req, issue);
     const { status, body } = issueWriteDenialResponse(code, labels);
+    if (issue.id && issue.companyId && req.actor.type === "agent") {
+      await recordIssueWriteDenial(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        agentId: req.actor.agentId ?? null,
+        code,
+        channel,
+        carriedRunId: req.actor.runId ?? null,
+      });
+    }
     res.status(status).json({
       error: body.error,
       details: { ...body.details, ...extraDetails },
@@ -4101,7 +4171,7 @@ export function issueRoutes(
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
     if (!boundaryDecision.allowed) {
-      return denyIssueWrite(req, res, issue, issueWriteDenialCodeForDecision(boundaryDecision));
+      return denyIssueWrite(req, res, issue, issueWriteDenialCodeForDecision(boundaryDecision), {}, "comment");
     }
     return boundaryDecision;
   }
@@ -13281,7 +13351,7 @@ export function issueRoutes(
         surface: "issue.comment.create",
         requestedValue: readNonEmptyString(req.body.onBehalfOfUserId),
       });
-      await denyIssueWrite(req, res, issue, "issue_write_attribution_spoof_rejected");
+      await denyIssueWrite(req, res, issue, "issue_write_attribution_spoof_rejected", {}, "comment");
       return;
     }
     const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);
