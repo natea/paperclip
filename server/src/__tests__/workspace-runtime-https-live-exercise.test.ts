@@ -24,7 +24,6 @@
  */
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
-import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -40,6 +39,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import { reservePortOutsideBrokerRange } from "./helpers/test-ports.js";
 import {
   reconcilePersistedRuntimeServicesOnStartup,
   resetRuntimeServicesForTests,
@@ -93,19 +93,12 @@ if (optedIn && !live) {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `pap17158-live-${randomUUID()}`;
 
-    // An ephemeral legacy port rather than the real template's 45439, so this
-    // never contends with the live workspace runtime on the same host.
-    const reservePort = async () => {
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        const probe = net.createServer();
-        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-        const address = probe.address();
-        const port = typeof address === "object" && address ? address.port : null;
-        await new Promise<void>((resolve, reject) => probe.close((e) => (e ? reject(e) : resolve())));
-        if (port && port <= 55_535 && (port < 42_000 || port > 42_999)) return port;
-      }
-      throw new Error("failed to reserve a legacy port outside the broker range");
-    };
+    // A reserved legacy port rather than the real template's 45439, so this
+    // never contends with the live workspace runtime on the same host. The
+    // shared helper binds an explicit in-window candidate; the old file-local
+    // copy filtered kernel-chosen ephemeral ports and so failed deterministically
+    // once the macOS ephemeral cursor walked past 55_535 (AND-48/AND-54).
+    const reservePort = reservePortOutsideBrokerRange;
 
     const companyId = randomUUID();
     const projectId = randomUUID();

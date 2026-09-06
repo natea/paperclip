@@ -78,6 +78,13 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import {
+  closeNetServer,
+  findFreePort,
+  listenOnPort,
+  reserveContiguousPorts,
+  reservePortOutsideBrokerRange,
+} from "./helpers/test-ports.js";
 
 const RUNTIME_OWNED_GIT_BRANCH_METADATA = {
   createdByRuntime: true,
@@ -339,94 +346,6 @@ function buildWorkspace(cwd: string): RealizedExecutionWorkspace {
     warnings: [],
     created: false,
   };
-}
-
-async function closeNetServer(server: net.Server) {
-  if (!server.listening) return;
-  await new Promise<void>((resolve, reject) => {
-    server.close((error) => error ? reject(error) : resolve());
-  });
-}
-
-async function listenOnPort(port: number) {
-  const server = net.createServer();
-  await new Promise<void>((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(port, "127.0.0.1", resolve);
-  });
-  return server;
-}
-
-async function findFreePort() {
-  const server = await listenOnPort(0);
-  const address = server.address();
-  const port = typeof address === "object" && address ? address.port : null;
-  await closeNetServer(server);
-  if (!port) throw new Error("Failed to find a free test port");
-  return port;
-}
-
-// macOS hands out ephemeral ports from a single machine-wide cursor that walks
-// `net.inet.ip.portrange.first` -> `.last` (49152 -> 65535) in order, rather
-// than picking randomly. Several tests need a port that is <= 55535 and outside
-// the broker's dedicated 42000-42999 allowlist, and they used to get one by
-// asking for an ephemeral port and retrying when it fell outside that window.
-// That is not a race and more retries do not help: once the shared cursor has
-// walked past 55535 -- which it does routinely on a dev box also running live
-// dev-watch -- *every* attempt lands out of range and the loop throws
-// "Failed to reserve ... outside the broker range" deterministically until the
-// cursor wraps. Bind an explicit candidate inside the wanted window instead, so
-// reservation depends on that port being free rather than on where a global
-// counter happens to be sitting.
-const BROKER_RESERVED_PORT_RANGE = { first: 42_000, last: 42_999 } as const;
-const TEST_PORT_WINDOW = { first: 20_000, last: 55_535 } as const;
-
-function isPortOutsideBrokerRange(port: number): boolean {
-  return (
-    port <= TEST_PORT_WINDOW.last &&
-    (port < BROKER_RESERVED_PORT_RANGE.first || port > BROKER_RESERVED_PORT_RANGE.last)
-  );
-}
-
-async function reservePortOutsideBrokerRange(): Promise<number> {
-  const span = TEST_PORT_WINDOW.last - TEST_PORT_WINDOW.first + 1;
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    const candidate = TEST_PORT_WINDOW.first + Math.floor(Math.random() * span);
-    if (!isPortOutsideBrokerRange(candidate)) continue;
-    try {
-      const server = await listenOnPort(candidate);
-      await closeNetServer(server);
-      return candidate;
-    } catch {
-      // Port is occupied; draw another candidate.
-    }
-  }
-  // Last resort: an ephemeral port may still satisfy the constraint if the
-  // kernel cursor is currently below the ceiling.
-  for (let attempt = 0; attempt < 50; attempt += 1) {
-    const port = await findFreePort();
-    if (isPortOutsideBrokerRange(port)) return port;
-  }
-  throw new Error(
-    `Failed to reserve a test port in ${TEST_PORT_WINDOW.first}-${TEST_PORT_WINDOW.last} outside the broker range ${BROKER_RESERVED_PORT_RANGE.first}-${BROKER_RESERVED_PORT_RANGE.last}`,
-  );
-}
-
-async function reserveContiguousPorts(count: number) {
-  for (let attempt = 0; attempt < 100; attempt += 1) {
-    const basePort = await findFreePort();
-    if (basePort + count - 1 > 65_535) continue;
-    const servers: net.Server[] = [];
-    try {
-      for (let offset = 0; offset < count; offset += 1) {
-        servers.push(await listenOnPort(basePort + offset));
-      }
-      return { basePort, servers };
-    } catch {
-      await Promise.all(servers.map((server) => closeNetServer(server).catch(() => undefined)));
-    }
-  }
-  throw new Error(`Failed to reserve ${count} contiguous test ports`);
 }
 
 function createWorkspaceOperationRecorderDouble() {
@@ -7616,17 +7535,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `runtime-desired-reconcile-${randomUUID()}`;
 
-    const reservePort = async () => {
-      const probe = net.createServer();
-      await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-      const address = probe.address();
-      const port = typeof address === "object" && address ? address.port : null;
-      await new Promise<void>((resolve, reject) => {
-        probe.close((error) => error ? reject(error) : resolve());
-      });
-      if (!port) throw new Error("Failed to reserve runtime reconciliation test port");
-      return port;
-    };
+    const reservePort = reservePortOutsideBrokerRange;
     const isLoopbackPortFree = async (port: number) => {
       const probe = net.createServer();
       return await new Promise<boolean>((resolve) => {
@@ -8323,16 +8232,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `runtime-unhealthy-adopt-${randomUUID()}`;
 
-    const portProbe = net.createServer();
-    await new Promise<void>((resolve) => portProbe.listen(0, "127.0.0.1", resolve));
-    const address = portProbe.address();
-    const stalePort = typeof address === "object" && address ? address.port : null;
-    await new Promise<void>((resolve, reject) => {
-      portProbe.close((err) => {
-        if (err) reject(err);
-        else resolve();
-      });
-    });
+    const stalePort = await reservePortOutsideBrokerRange();
     expect(stalePort).toBeTypeOf("number");
 
     const companyId = randomUUID();
