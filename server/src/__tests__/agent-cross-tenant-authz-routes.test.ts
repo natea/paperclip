@@ -422,7 +422,13 @@ describe.sequential("agent cross-tenant route authorization", () => {
     expect(mockAgentService.revokeKey).not.toHaveBeenCalled();
   });
 
-  it("requires board access before clearing an agent error", async () => {
+  it("denies clearing an agent error for an agent without a change grant", async () => {
+    mockAccessService.decide.mockResolvedValue({
+      allowed: false,
+      action: "agent_config:update",
+      reason: "deny_no_grant",
+      explanation: "No direct agent configuration grant.",
+    });
     const app = await createApp({
       type: "agent",
       agentId,
@@ -435,8 +441,46 @@ describe.sequential("agent cross-tenant route authorization", () => {
     );
 
     expect(res.status).toBe(403);
-    expect(res.body.error).toContain("Board access required");
+    expect(res.body).toMatchObject({
+      error: "No direct agent configuration grant.",
+      details: { reason: "deny_no_grant" },
+    });
     expect(mockAgentService.clearError).not.toHaveBeenCalled();
+  });
+
+  it("allows a same-company agent with a change grant to clear a report's error", async () => {
+    // AND-43: clear-error and resume land the agent in the same state, so a
+    // manager recovering its own report must not be told "Board access
+    // required" by one route and served by the other.
+    mockAgentService.getById.mockResolvedValue({ ...baseAgent, status: "error", errorReason: "Adapter failed" });
+    mockAgentService.clearError.mockResolvedValue({ ...baseAgent, status: "idle", errorReason: null });
+    mockAccessService.decide.mockResolvedValue({
+      allowed: true,
+      action: "agent_config:update",
+      reason: "allow_direct_change",
+      explanation: "Allowed by direct configuration grant.",
+      grant: { permissionKey: "agents:configure" },
+    });
+    const app = await createApp({
+      type: "agent",
+      agentId: "44444444-4444-4444-8444-444444444444",
+      companyId,
+      runId: "55555555-5555-4555-8555-555555555555",
+      keyId: "66666666-6666-4666-8666-666666666666",
+      source: "agent_key",
+    });
+
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl).post(`/api/agents/${agentId}/clear-error`).send({}),
+    );
+
+    expect(res.status).toBe(200);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({
+      action: "agent_config:update",
+      resource: { type: "agent", companyId, agentId },
+      scope: { requiresChangeGrant: true },
+    }));
+    expect(mockAgentService.clearError).toHaveBeenCalledWith(agentId);
   });
 
   it("preserves board resume access", async () => {

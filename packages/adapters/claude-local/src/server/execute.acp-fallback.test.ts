@@ -133,6 +133,67 @@ describe("claude_local ACP startup fallback", () => {
     );
   });
 
+  it("reports a teardown kill after a clean result as a provider success", async () => {
+    // AND-43: the CLI holds live background tasks past its terminal result, so
+    // the runner signals it and the shell reports 143. That is our own teardown
+    // of a finished run -- it must not be dressed up as an adapter failure.
+    runAdapterExecutionTargetProcess.mockResolvedValueOnce({
+      exitCode: 143,
+      signal: null,
+      timedOut: false,
+      stdout: [
+        JSON.stringify({ type: "system", subtype: "init", session_id: "claude-session-1", model: "claude-sonnet" }),
+        JSON.stringify({
+          type: "result",
+          subtype: "success",
+          is_error: false,
+          session_id: "claude-session-1",
+          result: "Progress comment posted.",
+          num_turns: 21,
+          api_error_status: null,
+          usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 },
+        }),
+      ].join("\n"),
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+      terminalResultCleanup: {
+        kind: "terminal_result_cleanup",
+        stopped: true,
+        stopReason: "unmanaged_background_task_stopped",
+        reason: "unmanaged background task stopped; no durable live path",
+        terminalResultSeen: true,
+        signal: "SIGTERM",
+        forceKilled: false,
+      },
+    } as never);
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.providerTerminalSuccess).toBe(true);
+    expect(result.errorMessage).toBeNull();
+    expect(result.errorCode).toBeNull();
+    // The raw exit code stays truthful; only its interpretation changes.
+    expect(result.exitCode).toBe(143);
+  });
+
+  it("still reports a signal kill without a clean result as signal-terminated", async () => {
+    runAdapterExecutionTargetProcess.mockResolvedValueOnce({
+      exitCode: 143,
+      signal: null,
+      timedOut: false,
+      stdout: "",
+      stderr: "",
+      pid: 123,
+      startedAt: new Date().toISOString(),
+    } as never);
+
+    const result = await execute(buildContext() as never);
+
+    expect(result.providerTerminalSuccess).toBeFalsy();
+    expect(result.errorCode).toBe("process_signal_terminated");
+  });
+
   it("keeps explicit ACP strict when startup fails", async () => {
     const ctx = buildContext({ engine: "acp" });
 

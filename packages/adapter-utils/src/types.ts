@@ -129,6 +129,18 @@ export interface AdapterExecutionResult {
       description?: string;
     }>;
   } | null;
+  /**
+   * True when the provider emitted a clean terminal result for this execution
+   * (for the Claude CLI: a `type: "result"` frame with `subtype: "success"` and
+   * `is_error: false`). It exists to separate "the model finished" from "the
+   * process exited zero", which stop agreeing the moment the run has to be torn
+   * down after the result: a CLI holding live background tasks does not exit on
+   * its own, so the runner signals it, and the shell reports 143. Without this
+   * flag the server reads that teardown exit as an adapter failure and marks a
+   * successful run `failed`. Absent means "no terminal result was parsed", which
+   * leaves the existing exit-code disposition in charge.
+   */
+  providerTerminalSuccess?: boolean;
   /** Present only for a persisted native-mode run; legacy adapters omit it. */
   nativeFinalization?: NativeFinalizationResult;
 }

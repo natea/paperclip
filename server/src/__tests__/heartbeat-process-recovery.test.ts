@@ -1175,7 +1175,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
-  async function seedQueuedIssueRunFixture() {
+  async function seedQueuedIssueRunFixture(
+    options: { withIssue?: boolean } = {},
+  ) {
+    const withIssue = options.withIssue ?? true;
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -1216,7 +1219,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
-      payload: { issueId },
+      payload: withIssue ? { issueId } : {},
       status: "queued",
       runId,
       requestedAt: now,
@@ -1231,14 +1234,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       triggerDetail: "system",
       status: "queued",
       wakeupRequestId,
-      contextSnapshot: {
-        issueId,
-        taskId: issueId,
-        wakeReason: "issue_assigned",
-      },
+      contextSnapshot: withIssue
+        ? {
+            issueId,
+            taskId: issueId,
+            wakeReason: "issue_assigned",
+          }
+        : {},
       updatedAt: now,
       createdAt: now,
     });
+
+    if (!withIssue) {
+      return { companyId, agentId, runId, wakeupRequestId, issueId: null };
+    }
 
     await db.insert(issues).values({
       id: issueId,
@@ -1315,6 +1324,134 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(missingCommentWakeups).toHaveLength(0);
     expect(agent).toEqual({ status: "running", errorReason: null });
   });
+
+  it("files an escalation against the manager when an agent falls into error", async () => {
+    // AND-43 defect 2: the transition into `error` used to be silent -- the
+    // agent stopped heartbeating and the only signal was a human listing
+    // agents.
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Adapter blew up",
+      provider: "test",
+      model: "test-model",
+    });
+
+    const { companyId, agentId, runId } = await seedQueuedIssueRunFixture({
+      withIssue: false,
+    });
+    const managerId = randomUUID();
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "EngManager",
+      role: "manager",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      permissions: {},
+    });
+    await db
+      .update(agents)
+      .set({ reportsTo: managerId, updatedAt: new Date() })
+      .where(eq(agents.id, agentId));
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "agent_error_escalation"),
+          eq(issues.originId, agentId),
+        ),
+      );
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toMatchObject({
+      priority: "critical",
+      assigneeAgentId: managerId,
+    });
+    // Filed open: the manager may already have picked it up by the time this
+    // reads, but it must not be born closed.
+    expect(["done", "cancelled"]).not.toContain(escalations[0]?.status);
+    expect(escalations[0]?.title).toContain("CodexCoder");
+    // The recovery route has to be in the escalation itself, not folded away
+    // in a doc the reader has to go find.
+    expect(escalations[0]?.description).toContain("/clear-error");
+    expect(escalations[0]?.description).toContain("/resume");
+
+    const managerWakeups = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, managerId),
+        ),
+      );
+    expect(managerWakeups.length).toBeGreaterThan(0);
+  });
+
+  it("records a run whose model finished cleanly as succeeded even when live background tasks forced a teardown kill", async () => {
+    // AND-43: the Claude CLI does not exit while it still holds live background
+    // tasks, so the runner signals it after the terminal result and the shell
+    // reports 143. Classifying that teardown as an adapter failure marked
+    // successful runs `failed` and flipped the agent into `error`.
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 143,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      providerTerminalSuccess: true,
+      summary: "Progress comment posted.",
+      provider: "test",
+      model: "test-model",
+      resultJson: {
+        subtype: "success",
+        is_error: false,
+        unmanagedBackgroundTask: {
+          kind: "terminal_result_cleanup",
+          stopped: true,
+          stopReason: "unmanaged_background_task_stopped",
+          reason: "unmanaged background task stopped; no durable live path",
+          terminalResultSeen: true,
+          signal: "SIGTERM",
+          forceKilled: false,
+        },
+      },
+    });
+
+    const { agentId, runId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run).toMatchObject({
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      // The raw exit code stays truthful for diagnostics.
+      exitCode: 143,
+    });
+
+    const agent = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(agent?.status).not.toBe("error");
+    expect(agent?.errorReason).toBeNull();
+  });
+
 
   it("keeps a local run active when the recorded pid is still alive", async () => {
     const child = spawnAliveProcess();

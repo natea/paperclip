@@ -15981,6 +15981,166 @@ export function heartbeatService(
     return trimmed.length > 500 ? `${trimmed.slice(0, 499)}…` : trimmed;
   }
 
+  /**
+   * The agent-reachable recovery route for an agent stuck in `error`, kept in
+   * one place so the escalation issue, the docs, and the API agree. See
+   * `docs/guides/board-operator/managing-agents.md` (AND-43).
+   */
+  function agentErrorRecoveryInstructions(agent: {
+    id: string;
+    name: string;
+  }) {
+    return [
+      `1. Read the failing run before clearing anything: \`GET /api/agents/${agent.id}/runs\` and the run log for the newest \`failed\` run.`,
+      `2. If the failure was infrastructure (a teardown kill, a lost process, a restart) rather than the agent's work, recover it: \`POST /api/agents/${agent.id}/clear-error\`, or \`POST /api/agents/${agent.id}/resume\` -- both return the agent to \`idle\` and clear \`errorReason\`. A manager with change-grant authority over its own report may call either; the board may always call either.`,
+      `3. If the failure is real, fix the cause first and file the fix as its own issue -- clearing the error only makes ${agent.name} heartbeat again, it does not fix anything.`,
+      `4. Close this issue once ${agent.name} has left \`error\` and taken a heartbeat.`,
+    ].join("\n");
+  }
+
+  function buildAgentErrorEscalationBody(input: {
+    agent: { id: string; name: string; role: string | null };
+    failureReason: string | null;
+    lastRun: { id: string; errorCode: string | null; finishedAt: Date | null } | null;
+    manager: { id: string; name: string } | null;
+  }) {
+    const { agent, lastRun } = input;
+    return [
+      `\`${agent.name}\`${agent.role ? ` (${agent.role})` : ""} entered \`status: error\` and has stopped heartbeating. Every issue assigned to it is stalled until it is recovered.`,
+      "",
+      "| field | value |",
+      "|---|---|",
+      `| agent | \`${agent.name}\` (\`${agent.id}\`) |`,
+      `| errorReason | ${input.failureReason ? `\`${input.failureReason}\`` : "_none recorded_"} |`,
+      `| last run | ${lastRun ? `\`${lastRun.id}\`` : "_unknown_"} |`,
+      `| errorCode | ${lastRun?.errorCode ? `\`${lastRun.errorCode}\`` : "_none_"} |`,
+      `| stopped at | ${lastRun?.finishedAt ? lastRun.finishedAt.toISOString() : "_unknown_"} |`,
+      "",
+      "## Recovery",
+      "",
+      agentErrorRecoveryInstructions(agent),
+      "",
+      input.manager
+        ? `Owner: \`${input.manager.name}\`, this agent's manager.`
+        : "This agent has no manager, so recovery is the board's: the issue is filed unassigned deliberately.",
+    ].join("\n");
+  }
+
+  async function findOpenAgentErrorEscalation(agent: {
+    id: string;
+    companyId: string;
+  }) {
+    return db
+      .select({ id: issues.id, identifier: issues.identifier })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, agent.companyId),
+          eq(issues.originKind, RECOVERY_ORIGIN_KINDS.agentErrorEscalation),
+          eq(issues.originId, agent.id),
+          visibleIssueCondition(),
+          notInArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issues.createdAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  /**
+   * Make an agent falling into `error` observable. Before AND-43 this
+   * transition was silent: the agent stopped heartbeating, every issue behind
+   * it stalled, and the only way to notice was for a human to list agents. File
+   * it against the agent's manager (unassigned when it has none, which routes
+   * it to the board) and wake the manager so somebody owns the recovery.
+   */
+  async function escalateAgentError(input: {
+    agent: typeof agents.$inferSelect;
+    failureReason: string | null;
+  }) {
+    const { agent } = input;
+    const existingEscalation = await findOpenAgentErrorEscalation(agent);
+    if (existingEscalation) return existingEscalation;
+
+    const lastRun = await db
+      .select({
+        id: heartbeatRuns.id,
+        errorCode: heartbeatRuns.errorCode,
+        finishedAt: heartbeatRuns.finishedAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agent.id),
+          eq(heartbeatRuns.status, "failed"),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.startedAt))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+    const manager = agent.reportsTo ? await getAgent(agent.reportsTo) : null;
+
+    const escalation = await issuesSvc.create(agent.companyId, {
+      title: `${agent.name} stopped in error and needs recovery`,
+      description: buildAgentErrorEscalationBody({
+        agent: { id: agent.id, name: agent.name, role: agent.role },
+        failureReason: input.failureReason,
+        lastRun,
+        manager: manager ? { id: manager.id, name: manager.name } : null,
+      }),
+      status: "todo",
+      priority: "critical",
+      assigneeAgentId: manager?.id ?? null,
+      originKind: RECOVERY_ORIGIN_KINDS.agentErrorEscalation,
+      originId: agent.id,
+      originFingerprint: `agent_error:${agent.id}`,
+    });
+
+    await logActivity(db, {
+      companyId: agent.companyId,
+      actorType: "system",
+      actorId: "heartbeat",
+      action: "agent.error_escalated",
+      entityType: "agent",
+      entityId: agent.id,
+      agentId: manager?.id ?? null,
+      details: {
+        escalationIssueId: escalation.id,
+        errorReason: input.failureReason ?? null,
+        lastRunId: lastRun?.id ?? null,
+        lastRunErrorCode: lastRun?.errorCode ?? null,
+        managerAgentId: manager?.id ?? null,
+      },
+    });
+
+    if (manager?.id) {
+      await enqueueWakeup(manager.id, {
+        source: "assignment",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        idempotencyKey: `agent-error-escalation:${escalation.id}`,
+        payload: withRecoveryContext(
+          { issueId: escalation.id, erroredAgentId: agent.id },
+          "status_only",
+        ),
+        requestedByActorType: "system",
+        requestedByActorId: "heartbeat",
+        contextSnapshot: withRecoveryContext(
+          {
+            issueId: escalation.id,
+            taskId: escalation.id,
+            wakeReason: "issue_assigned",
+            source: RECOVERY_ORIGIN_KINDS.agentErrorEscalation,
+            erroredAgentId: agent.id,
+          },
+          "status_only",
+        ),
+      });
+    }
+
+    return escalation;
+  }
+
   async function finalizeAgentStatus(
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -16048,6 +16208,26 @@ export function heartbeatService(
           outcome,
         },
       });
+    }
+
+    // AND-43: an agent entering `error` stops heartbeating and stalls every
+    // issue behind it, so the transition -- not the steady state -- is what has
+    // to raise an owner. Only escalate on the edge into `error`; an agent
+    // already there has an open escalation.
+    if (updated && updated.status === "error" && existing.status !== "error") {
+      try {
+        await escalateAgentError({
+          agent: updated,
+          failureReason: truncateAgentErrorReason(failureReason),
+        });
+      } catch (error) {
+        // A failed escalation must not swallow the status write that just
+        // landed: the agent is still correctly in `error` either way.
+        logger.error(
+          { error, agentId: updated.id },
+          "failed to escalate agent error to a manager",
+        );
+      }
     }
   }
 
@@ -21183,6 +21363,16 @@ export function heartbeatService(
           (adapterResult.exitCode ?? 0) === 0 &&
           !adapterResult.errorMessage
         ) {
+          outcome = "succeeded";
+        } else if (
+          adapterResult.providerTerminalSuccess &&
+          !adapterResult.errorMessage
+        ) {
+          // The model emitted a clean terminal result and named no error; the
+          // nonzero exit came from tearing the process down afterwards (a CLI
+          // holding live background tasks has to be signalled, and the shell
+          // reports 143). Teardown of a finished run is not an adapter failure.
+          // See AND-43.
           outcome = "succeeded";
         } else {
           outcome = "failed";

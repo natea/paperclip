@@ -2182,6 +2182,8 @@ registry.registerPath({
   path: "/api/agents/{id}/clear-error",
   tags: ["agents"],
   summary: "Clear an agent error",
+  description:
+    "Returns an agent from `error` to `idle` and clears its `errorReason`. The board may clear any agent in the company; an agent caller needs `agents:configure` change-grant authority over the target, which is how a manager recovers its own report. `POST /api/agents/{id}/resume` has the same effect and the same agent-side authority check.",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });

@@ -1,4 +1,5 @@
 export const RECOVERY_ORIGIN_KINDS = {
+  agentErrorEscalation: "agent_error_escalation",
   issueGraphLivenessEscalation: "harness_liveness_escalation",
   issueProductivityReview: "issue_productivity_review",
   strandedIssueRecovery: "stranded_issue_recovery",

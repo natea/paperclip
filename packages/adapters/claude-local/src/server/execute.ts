@@ -1194,11 +1194,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorMessage,
         })
       : null;
+    // The provider emitted a clean terminal result and then the runner killed
+    // the process itself, because a CLI still holding live background tasks
+    // never exits on its own. That kill is our own teardown of a finished run,
+    // not a provider or infrastructure fault, so it must not borrow the
+    // signal-termination disposition -- doing so marked successful runs
+    // `failed` / `Adapter failed` and tripped the agent into `error`.
+    const ownTerminalResultCleanupKill =
+      signalTerminated &&
+      parsedSucceeded &&
+      proc.terminalResultCleanup?.terminalResultSeen === true;
     const resolvedErrorCode = proc.errorCode
       // Forward the transport-level error code from the run-disposition seam
       // first. A lost duplex control channel surfaces the typed
       // `duplex_channel_lost` code before any provider classification.
       ? proc.errorCode
+      : ownTerminalResultCleanupKill
+      ? null
       : signalTerminated
       ? PROCESS_SIGNAL_TERMINATED_ERROR_CODE
       : loginMeta.requiresLogin
@@ -1246,6 +1258,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       timedOut: false,
       errorMessage,
       errorCode: resolvedErrorCode,
+      // Carry the provider's own verdict alongside the raw exit code: the exit
+      // code stays truthful for diagnostics, and the server stops reading a
+      // post-success teardown as an adapter failure.
+      providerTerminalSuccess: parsedSucceeded,
       errorFamily,
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,
