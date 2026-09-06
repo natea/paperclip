@@ -161,8 +161,51 @@ describeEmbeddedPostgres("refused issue writes leave durable evidence", () => {
     expect(row?.details).toMatchObject({ carriedRunId });
   });
 
-  // A run that exists but names no task is the other half of AND-22.
+  // A run that exists but names no task is the other half of AND-22. Since
+  // AND-58 such a run may still write to a task it is the assignee of, so the
+  // denial is pinned on the shape that is still genuinely cross-issue: an
+  // unbound run reaching for a task that is neither assigned to it nor checked
+  // out by it.
   it("records a comment-channel denial when the run is bound to no task", async () => {
+    const fixture = await seed();
+    const foreignIssue = await db.insert(issues).values({
+      companyId: fixture.company.id,
+      identifier: `${fixture.company.issuePrefix}-2`,
+      title: "Someone else's work",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: null,
+    }).returning().then((rows) => rows[0]!);
+    const run = await db.insert(heartbeatRuns).values({
+      companyId: fixture.company.id,
+      agentId: fixture.agent.id,
+      status: "running",
+      contextSnapshot: {},
+    }).returning().then((rows) => rows[0]!);
+    const app = await createApp(db, {
+      type: "agent",
+      agentId: fixture.agent.id,
+      companyId: fixture.company.id,
+      runId: run.id,
+      source: "agent_jwt",
+    } as Express.Request["actor"]);
+
+    const response = await request(app)
+      .post(`/api/issues/${foreignIssue.id}/comments`)
+      .send({ body: "Heartbeat progress note" });
+
+    expect(response.status, JSON.stringify(response.body)).toBe(403);
+    const rows = await denialRows(fixture.company.id, foreignIssue.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.details).toMatchObject({
+      code: "cross_issue_influence_run_not_task_bound",
+      channel: "comment",
+    });
+  });
+
+  // AND-58: the same unbound run, aimed at the task it is assigned, is not
+  // cross-issue influence and must not be refused or recorded as a denial.
+  it("accepts the unbound run's comment on the task it is assigned", async () => {
     const fixture = await seed();
     const run = await db.insert(heartbeatRuns).values({
       companyId: fixture.company.id,
@@ -182,13 +225,8 @@ describeEmbeddedPostgres("refused issue writes leave durable evidence", () => {
       .post(`/api/issues/${fixture.issue.id}/comments`)
       .send({ body: "Heartbeat progress note" });
 
-    expect(response.status, JSON.stringify(response.body)).toBe(403);
-    const rows = await denialRows(fixture.company.id, fixture.issue.id);
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.details).toMatchObject({
-      code: "cross_issue_influence_run_not_task_bound",
-      channel: "comment",
-    });
+    expect(response.status, JSON.stringify(response.body)).toBe(201);
+    expect(await denialRows(fixture.company.id, fixture.issue.id)).toHaveLength(0);
   });
 
   it("writes no denial evidence when the comment is accepted", async () => {

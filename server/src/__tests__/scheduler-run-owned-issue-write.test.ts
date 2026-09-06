@@ -2,7 +2,9 @@ import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { and, eq } from "drizzle-orm";
 import {
+  activityLog,
   agents,
   companies,
   createDb,
@@ -78,6 +80,7 @@ describeWithDb("scheduler-driven run writing to an issue it owns (AND-25)", () =
     const secondIssueId = randomUUID();
     const foreignAgentId = randomUUID();
     const foreignIssueId = randomUUID();
+    const parkedIssueId = randomUUID();
 
     await db.insert(companies).values({
       id: companyId,
@@ -118,10 +121,14 @@ describeWithDb("scheduler-driven run writing to an issue it owns (AND-25)", () =
         wakeTriggerDetail: "system",
       } as never,
     });
-    for (const [id, identifierSuffix, assignee, title] of [
-      [ownIssueId, 1, agentId, "Own task"],
-      [secondIssueId, 2, agentId, "Second own task"],
-      [foreignIssueId, 3, foreignAgentId, "Another agent's task"],
+    for (const [id, identifierSuffix, assignee, title, status] of [
+      [ownIssueId, 1, agentId, "Own task", "todo"],
+      [secondIssueId, 2, agentId, "Second own task", "todo"],
+      [foreignIssueId, 3, foreignAgentId, "Another agent's task", "todo"],
+      // AND-58: a task this agent is assigned that is legitimately parked
+      // awaiting a board response. Checkout would move it to `in_progress`, so
+      // it is the case that must be writable *without* taking the lock.
+      [parkedIssueId, 4, agentId, "Parked own task", "in_review"],
     ] as const) {
       await db.insert(issues).values({
         id,
@@ -129,7 +136,7 @@ describeWithDb("scheduler-driven run writing to an issue it owns (AND-25)", () =
         identifier: `SR${seq}-${identifierSuffix}`,
         title,
         description: "Seeded for the AND-25 regression shape.",
-        status: "todo",
+        status,
         priority: "medium",
         assigneeAgentId: assignee,
       });
@@ -142,6 +149,7 @@ describeWithDb("scheduler-driven run writing to an issue it owns (AND-25)", () =
       ownIssueId,
       secondIssueId,
       foreignIssueId,
+      parkedIssueId,
       app: buildApp({ type: "agent", source: "agent_key", companyId, agentId, runId }),
     };
   }
@@ -203,5 +211,61 @@ describeWithDb("scheduler-driven run writing to an issue it owns (AND-25)", () =
     // send a run-context-carrying request back for another identical retry.
     expect(patch.body?.details?.sanctionedPath).not.toContain("$PAPERCLIP_RUN_ID");
     expect(patch.body?.details?.sanctionedPath).not.toMatch(/\$[A-Z][A-Z0-9_]*/);
+  });
+
+  /**
+   * AND-58: requiring checkout to write to a task you are already assigned is
+   * not just an ergonomic wart — checkout moves the issue to `in_progress`, so
+   * the sanctioned remedy destroyed the state of any task legitimately parked
+   * in `in_review` behind a pending board card. An assignee writing to its own
+   * task is not the cross-issue influence the guard exists to catch.
+   */
+  it("lets an unbound run comment on its own assigned task without checking it out", async () => {
+    const seeded = await seedSchedulerDrivenRun();
+
+    const comment = await request(seeded.app)
+      .post(`/api/issues/${seeded.parkedIssueId}/comments`)
+      .send({ body: "Status from a timer wake, without disturbing the parked state." });
+    expect(comment.status).toBe(201);
+
+    // The whole point: the parked issue is still parked.
+    const after = await db
+      .select({ status: issues.status, checkoutRunId: issues.checkoutRunId })
+      .from(issues)
+      .where(eq(issues.id, seeded.parkedIssueId))
+      .then((rows) => rows[0]);
+    expect(after?.status).toBe("in_review");
+    expect(after?.checkoutRunId).toBeNull();
+  });
+
+  it("lets an unbound run PATCH its own assigned task without checking it out", async () => {
+    const seeded = await seedSchedulerDrivenRun();
+
+    const patch = await request(seeded.app)
+      .patch(`/api/issues/${seeded.ownIssueId}`)
+      .send({ priority: "high", comment: "Re-prioritised from a timer wake." });
+    expect(patch.status).toBe(200);
+    expect(patch.body?.priority).toBe("high");
+  });
+
+  it("still counts unbound assignee writes against the per-run cap", async () => {
+    // Assignment is not something this run asserted, so — unlike a checkout
+    // lock — it does not exempt the write from the fan-out backstop.
+    const seeded = await seedSchedulerDrivenRun();
+
+    const comment = await request(seeded.app)
+      .post(`/api/issues/${seeded.parkedIssueId}/comments`)
+      .send({ body: "Counted write." });
+    expect(comment.status).toBe(201);
+
+    const observed = await db
+      .select({ id: activityLog.id, details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.runId, seeded.runId),
+        eq(activityLog.action, "issue.cross_issue_influence_observed"),
+      ));
+    expect(observed).toHaveLength(1);
+    expect((observed[0]?.details as { unboundAssigneeWrite?: boolean }).unboundAssigneeWrite).toBe(true);
   });
 });

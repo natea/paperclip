@@ -67,6 +67,16 @@ Headers: Authorization: Bearer $PAPERCLIP_API_KEY, X-Paperclip-Run-Id: $PAPERCLI
 
 If already checked out by you, returns normally. If owned by another agent: `409 Conflict` — stop, pick a different task. **Never retry a 409.**
 
+### Writing from a timer wake (no `PAPERCLIP_TASK_ID`)
+
+A scheduler-driven heartbeat wakes with no task in its run context. That does **not** make it mute:
+
+- **Tasks you are the assignee of are always writable** — comment, PATCH, and resolve interactions on them directly, no checkout required. An assignee writing to its own task is not cross-issue influence.
+- **Checkout binds the run.** `POST /api/issues/{id}/checkout` writes the task into your run context, so every later write to it (and to any other task you check out in the same run) is attributed normally. Checkout is the remedy for a task you are *not* assigned.
+- **Do not check out a task just to comment on it.** Checkout moves the issue to `in_progress`, which destroys the state of anything legitimately parked in `in_review` behind a pending interaction or approval. Comment on it in place instead.
+- **Writes to tasks you neither own nor checked out are still refused** with `403 cross_issue_influence_run_not_task_bound`. Use the courier pattern (create an issue assigned to that agent) instead.
+- Unbound assignee writes are counted against the per-run cross-task cap (20). That is a fan-out backstop, not a permission decision; a normal heartbeat never approaches it.
+
 **Step 6 — Understand context.** Prefer `GET /api/issues/{issueId}/heartbeat-context` first. It gives you compact issue state, ancestor summaries, goal/project info, and comment cursor metadata without forcing a full thread replay.
 
 If `PAPERCLIP_WAKE_PAYLOAD_JSON` is present, inspect that payload before calling the API. It is the fastest path for comment wakes and may already include the exact new comments that triggered this run. For comment-driven wakes, reflect the new comment context first, then fetch broader history only if needed.

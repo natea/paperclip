@@ -126,6 +126,9 @@ export async function observeCrossIssueInfluence(
     }
 
     let sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    // AND-58: an unbound run writing to a task it is the *assignee* of is
+    // allowed, but unlike a lock-holding write it is still counted. See below.
+    let unboundAssigneeWrite = false;
     if (!sourceIssueId) {
       // An unbound (scheduler-driven) run is still allowed to write to a task it
       // holds the checkout or execution lock on: that write is self-evidently
@@ -134,6 +137,7 @@ export async function observeCrossIssueInfluence(
         .select({
           checkoutRunId: issues.checkoutRunId,
           executionRunId: issues.executionRunId,
+          assigneeAgentId: issues.assigneeAgentId,
         })
         .from(issues)
         .where(and(eq(issues.id, input.targetIssueId), eq(issues.companyId, input.companyId)))
@@ -141,12 +145,30 @@ export async function observeCrossIssueInfluence(
       const ownsTarget = Boolean(
         target && (target.checkoutRunId === input.runId || target.executionRunId === input.runId),
       );
-      if (!ownsTarget) throw crossIssueInfluenceRunNotTaskBoundError();
-      sourceIssueId = input.targetIssueId;
+      if (ownsTarget) {
+        sourceIssueId = input.targetIssueId;
+      } else if (target && target.assigneeAgentId === input.agentId) {
+        // AND-58: the guard exists to stop one run fanning writes across tasks
+        // that are none of its business. An agent commenting on a task it is
+        // already the assignee of is not that case, and forcing checkout for it
+        // was actively harmful: checkout moves the issue to `in_progress`, so
+        // the only sanctioned way to report on a task legitimately parked in
+        // `in_review` was to disturb the state that parked it (AND-3).
+        //
+        // This tier is allowed but *not* exempted from the counter, because
+        // assignment — unlike a checkout lock — is not something this run
+        // asserted. Counting keeps the per-run cap as a fan-out backstop over
+        // however many tasks the agent happens to be assigned.
+        sourceIssueId = input.targetIssueId;
+        unboundAssigneeWrite = true;
+      } else {
+        throw crossIssueInfluenceRunNotTaskBoundError();
+      }
     }
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      !unboundAssigneeWrite &&
+      (sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase()))
     ) {
       return null;
     }
@@ -179,6 +201,7 @@ export async function observeCrossIssueInfluence(
         sourceIssueId,
         targetIssueId: input.targetIssueId,
         targetIssueIdentifier: input.targetIssueIdentifier ?? null,
+        unboundAssigneeWrite,
         count: decision.count,
         cap: decision.cap,
         mode: decision.mode,
@@ -194,6 +217,7 @@ export async function observeCrossIssueInfluence(
       agentId: input.agentId,
       sourceIssueId,
       targetIssueId: input.targetIssueId,
+      unboundAssigneeWrite,
       kind: input.kind,
       count: decision.count,
       cap: decision.cap,

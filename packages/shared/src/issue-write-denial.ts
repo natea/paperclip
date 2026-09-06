@@ -304,9 +304,10 @@ export function describeIssueWriteDenial(
         description:
           `The run id on this request is valid and was accepted — the problem is not the ` +
           `header. This heartbeat started without a task (a scheduler-driven or unassigned ` +
-          `wake), so its run context names no source issue, and every write it attempts ` +
-          `looks cross-issue with nothing to measure it against.`,
-        whoCanAct: `${actor}, from a run that is bound to a task.`,
+          `wake), so its run context names no source issue. Such a run may still write to a ` +
+          `task it is the assignee of, or one it holds the checkout lock on; this target is ` +
+          `neither, so the write has nothing to measure itself against.`,
+        whoCanAct: `${actor}, from a run bound to this task — or from any run, if it is assigned this task.`,
         // AND-22: the sanctioned path must name something the caller has *not*
         // already done. Repeating "send the run id header" to a caller that sent
         // it is what induced the blind retry loop this code exists to end.
