@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq, or, inArray, sql } from "drizzle-orm";
+import { and, eq, getTableName, or, inArray, sql } from "drizzle-orm";
 import {
   afterAll,
   afterEach,
@@ -331,6 +331,78 @@ async function spawnOrphanedProcessGroup() {
   };
 }
 
+// The teardown below waits on two 5s idle budgets and then clears every fixture
+// table. Inheriting the file-wide 30s `hookTimeout` gave all 130 tests in this
+// suite one shared budget, so on a loaded machine the hook was killed
+// mid-teardown — leaving rows behind and failing the *next* test with a bogus
+// assertion. Give the hook its own, larger budget (AND-35).
+const TEARDOWN_TIMEOUT_MS = 60_000;
+
+// Every table seeded by this suite's fixtures, cleared between tests. Order is
+// irrelevant: a single `TRUNCATE ... CASCADE` resolves foreign keys itself, so
+// this replaces ~30 sequential deletes wrapped in four 5-attempt retry loops
+// that existed only to survive FK ordering races (AND-35). `authUsers` is
+// deliberately absent — `beforeAll` seeds `responsible-user` once and every
+// test depends on it surviving. CASCADE only truncates tables that *reference*
+// these, never their parents, so that row is safe.
+const FIXTURE_TABLES = [
+  activityLog,
+  agentRuntimeState,
+  agentWakeupRequests,
+  agents,
+  budgetPolicies,
+  companySecretBindings,
+  companySecrets,
+  companySkills,
+  companies,
+  costEvents,
+  documentAnnotationAnchorSnapshots,
+  documentAnnotationComments,
+  documentAnnotationThreads,
+  documentRevisions,
+  documents,
+  environmentLeases,
+  environments,
+  executionWorkspaces,
+  heartbeatRunEvents,
+  heartbeatRuns,
+  issueComments,
+  issueDocuments,
+  issuePlanDecompositions,
+  issueRecoveryActions,
+  issueRelations,
+  issueThreadInteractions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
+  issueWorkProducts,
+  issues,
+  plugins,
+  projectWorkspaces,
+  projects,
+  workspaceOperations,
+];
+
+async function truncateFixtureTables(db: ReturnType<typeof createDb>) {
+  const targets = FIXTURE_TABLES.map(
+    (table) => `"${getTableName(table)}"`,
+  ).join(", ");
+  // A recovery child process that outlived the idle wait can still hold a row
+  // lock. TRUNCATE needs ACCESS EXCLUSIVE, so bound the wait and retry rather
+  // than blocking until the hook times out.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await db.transaction(async (tx) => {
+        await tx.execute(sql.raw("SET LOCAL lock_timeout = '2s'"));
+        await tx.execute(sql.raw(`TRUNCATE TABLE ${targets} CASCADE`));
+      });
+      return;
+    } catch (error) {
+      if (attempt === 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
 describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<
@@ -412,91 +484,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await waitForHeartbeatIdle(db, 5_000);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    await db.delete(activityLog);
-    await db.delete(agentRuntimeState);
-    await db.delete(companySkills);
-    await db.delete(costEvents);
-    await db.delete(workspaceOperations);
-    await db.delete(environmentLeases);
-    await db.delete(environments);
-    await db.delete(plugins);
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueThreadInteractions);
-    await db.delete(documentAnnotationComments);
-    await db.delete(documentAnnotationAnchorSnapshots);
-    await db.delete(documentAnnotationThreads);
-    await db.delete(issueWorkProducts);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(issueComments);
-      await db.delete(issueDocuments);
-      try {
-        await db.delete(issues);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(activityLog);
-      await db.delete(heartbeatRunEvents);
-      try {
-        await db.delete(heartbeatRuns);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(agentWakeupRequests);
-    await db.delete(budgetPolicies);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      // A still-alive recovery child process can insert a new wakeup request
-      // or runtime-state row after the first delete. Re-clear both rows each
-      // attempt so a late insert cannot hold the agents foreign key.
-      await db.delete(agentWakeupRequests);
-      await db.delete(agentRuntimeState);
-      try {
-        await db.delete(agents);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(companySkills);
-      await db.delete(workspaceOperations);
-      await db.delete(executionWorkspaces);
-      await db.delete(projectWorkspaces);
-      await db.delete(projects);
-      await db.delete(issuePlanDecompositions);
-      await db.delete(issueThreadInteractions);
-      await db.delete(documentAnnotationComments);
-      await db.delete(documentAnnotationAnchorSnapshots);
-      await db.delete(documentAnnotationThreads);
-      await db.delete(issueDocuments);
-      await db.delete(documentRevisions);
-      await db.delete(documents);
-      await db.delete(companySecretBindings);
-      await db.delete(companySecrets);
-      try {
-        await db.delete(companies);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-  });
+    await truncateFixtureTables(db);
+  }, TEARDOWN_TIMEOUT_MS);
 
   afterAll(async () => {
     for (const child of childProcesses) {
