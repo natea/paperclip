@@ -546,7 +546,7 @@ describe("issue execution policy routes", () => {
     expect(activityTx).toBe(updateTx);
   });
 
-  it("rejects a review binding to a confirmation from another run", async () => {
+  it("binds a confirmation this agent opened in an earlier run to the review transition", async () => {
     const issue = {
       id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       companyId: "company-1",
@@ -565,8 +565,62 @@ describe("issue execution policy routes", () => {
       kind: "request_confirmation",
       status: "pending",
       createdByAgentId: "33333333-3333-4333-8333-333333333333",
+      // Opened in the previous heartbeat's run; the actor below is the next wake.
       sourceRunId: "44444444-4444-4444-8444-444444444444",
-      payload: { version: 1, prompt: "Approve another run's request?" },
+      payload: { version: 1, prompt: "Approve this review?" },
+    }]);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp({
+      type: "agent",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      companyId: "company-1",
+      runId: "55555555-5555-4555-8555-555555555555",
+    }))
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({
+        status: "in_review",
+        reviewInteractionId: "11111111-1111-4111-8111-111111111111",
+      });
+
+    expect(res.status).toBe(200);
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({
+          reviewInteractionId: "11111111-1111-4111-8111-111111111111",
+        }),
+      }),
+      expect.any(Array),
+    );
+  });
+
+  it("rejects a review binding to a confirmation created by another agent", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "todo",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1004",
+      title: "Pending confirmation",
+      executionPolicy: null,
+      executionState: null,
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([{
+      id: "11111111-1111-4111-8111-111111111111",
+      kind: "request_confirmation",
+      status: "pending",
+      createdByAgentId: "66666666-6666-4666-8666-666666666666",
+      sourceRunId: "44444444-4444-4444-8444-444444444444",
+      payload: { version: 1, prompt: "Approve another agent's request?" },
     }]);
 
     const res = await request(await createApp({
@@ -583,7 +637,7 @@ describe("issue execution policy routes", () => {
 
     expect(res.status).toBe(422);
     expect(res.body).toMatchObject({
-      error: expect.stringContaining("created by this agent run"),
+      error: expect.stringContaining("created by another agent"),
       details: { code: "invalid_review_interaction" },
     });
     expect(mockIssueService.update).not.toHaveBeenCalled();

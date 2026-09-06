@@ -3628,7 +3628,6 @@ export function issueRoutes(
     actorType: "agent" | "user";
     actorId: string;
     actorAgentId?: string | null;
-    actorRunId?: string | null;
     reviewInteractionId?: string;
   }) {
     const nextStatus = typeof input.updateFields.status === "string"
@@ -3640,15 +3639,9 @@ export function issueRoutes(
     const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
     const pendingInteractions = interactions.filter((interaction) => interaction.status === "pending");
     if (input.reviewInteractionId) {
-      const designatedReviewConfirmation = pendingInteractions.find((interaction) =>
-        interaction.id === input.reviewInteractionId
-        && (interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation")
-        && (
-          input.actorType === "agent"
-            ? interaction.createdByAgentId === input.actorAgentId
-              && interaction.sourceRunId === input.actorRunId
-            : interaction.createdByUserId === input.actorId
-        )
+      type PendingInteraction = (typeof pendingInteractions)[number];
+      const isBindableConfirmation = (interaction: PendingInteraction) =>
+        (interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation")
         && !(
           interaction.kind === "request_confirmation"
           && interaction.payload
@@ -3657,13 +3650,35 @@ export function issueRoutes(
             ("toolAction" in interaction.payload && interaction.payload.toolAction !== undefined)
             || ("secretProposal" in interaction.payload && interaction.payload.secretProposal !== undefined)
           )
-        )
+        );
+      // The binding is agent-scoped, not run-scoped. Runs are per heartbeat, so the
+      // sanctioned continuation pattern (open a confirmation, resume on the next wake)
+      // names a card from an earlier run of the same agent. Cross-agent binding stays
+      // refused: that is the authorization boundary this guard exists for.
+      const isOwnedByActor = (interaction: PendingInteraction) =>
+        input.actorType === "agent"
+          ? typeof input.actorAgentId === "string"
+            && input.actorAgentId.length > 0
+            && interaction.createdByAgentId === input.actorAgentId
+          : interaction.createdByUserId === input.actorId;
+      const namedInteraction = pendingInteractions.find((interaction) =>
+        interaction.id === input.reviewInteractionId
       );
+      const designatedReviewConfirmation = namedInteraction
+          && isBindableConfirmation(namedInteraction)
+          && isOwnedByActor(namedInteraction)
+        ? namedInteraction
+        : undefined;
       if (!designatedReviewConfirmation) {
         const creatorDescription = input.actorType === "agent"
-          ? "this agent run"
+          ? "this agent"
           : "this user";
-        throw unprocessable(`reviewInteractionId must identify a pending non-tool confirmation created by ${creatorDescription}`, {
+        const ownershipDetail = namedInteraction
+          && isBindableConfirmation(namedInteraction)
+          && !isOwnedByActor(namedInteraction)
+          ? `; that confirmation was created by ${input.actorType === "agent" ? "another agent" : "another writer"}`
+          : "";
+        throw unprocessable(`reviewInteractionId must identify a pending non-tool confirmation created by ${creatorDescription}${ownershipDetail}`, {
           code: "invalid_review_interaction",
           reviewInteractionId: input.reviewInteractionId,
         });
@@ -7469,7 +7484,6 @@ export function issueRoutes(
             actorType: actor.actorType,
             actorId: actor.actorId,
             actorAgentId: actor.agentId,
-            actorRunId: actor.runId,
           });
           const executionPolicy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
           const transition = applyIssueExecutionPolicyTransition({
@@ -10328,7 +10342,6 @@ export function issueRoutes(
       actorType: actor.actorType,
       actorId: actor.actorId,
       actorAgentId: actor.agentId,
-      actorRunId: actor.runId,
       reviewInteractionId: requestedReviewInteractionId,
     });
     const enteringReviewRequested =
