@@ -13,6 +13,10 @@ import {
 } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
+import {
+  attributeIssueWriteDenialsToRuns,
+  ISSUE_WRITE_DENIED_ACTIVITY,
+} from "./issue-write-denial-record.js";
 import { budgetService } from "./budgets.js";
 import { issueService } from "./issues.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
@@ -36,6 +40,30 @@ const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 const MAX_CANDIDATE_ISSUES = 250;
 const MAX_RUNS_FOR_STREAK = 100;
 const MAX_PARENT_WALK_DEPTH = 25;
+// Run error codes that mean the platform stopped the run rather than the agent
+// failing at the work: a shutdown drain, an OS signal to the provider process,
+// a process that did not survive a restart, or one deliberately left detached
+// across one. A burst of these with no billable usage is contention -- AND-17's
+// livelock produced ten such runs in an hour -- and without this distinction it
+// reads as `high_churn`, i.e. as an agent spinning on its own work.
+const INFRASTRUCTURE_TERMINATION_ERROR_CODES = new Set<string>([
+  "server_shutdown_interrupted",
+  "process_signal_terminated",
+  "process_lost",
+  "process_detached",
+]);
+// Two is enough to separate a single unlucky restart from a pattern; paired
+// with zero billable cost it is the signature the AND-16 review missed.
+const CONTENTION_SUSPECTED_MIN_RUNS = 2;
+// AND-29. The infrastructure-termination signature above only catches runs the
+// platform killed. AND-16 and AND-23 were the other shape entirely: runs that
+// succeeded and billed real cost while every comment they attempted came back
+// 403 from the write guard. `no_comment_streak` measures *persisted* comments,
+// so a closed channel and an idle agent are indistinguishable to it -- unless
+// the refusals themselves are on the record. `issue.write_denied` activity rows
+// (written by every denial funnel in the issue routes) are that record, and one
+// refused comment attempt in a run is enough: the agent demonstrably spoke.
+const COMMENT_DENIAL_CHANNEL = "comment";
 export const PRODUCTIVITY_REVIEW_REFRESH_COMMENT_PREFIX = "Productivity review evidence refreshed.";
 
 type IssueRow = typeof issues.$inferSelect;
@@ -45,7 +73,7 @@ type HeartbeatRunRow = typeof heartbeatRuns.$inferSelect;
 // result_json/context_snapshot for up to MAX_RUNS_FOR_STREAK runs per issue.
 type ProductivityRunSample = Pick<
   HeartbeatRunRow,
-  "id" | "agentId" | "status" | "livenessState" | "createdAt" | "nextAction" | "usageJson"
+  "id" | "agentId" | "status" | "livenessState" | "createdAt" | "nextAction" | "usageJson" | "errorCode"
 >;
 type ProductivityReviewTrigger = "no_comment_streak" | "long_active_duration" | "high_churn";
 
@@ -80,6 +108,20 @@ type ProductivityReviewEvidence = {
   latestRuns: ProductivityRunSample[];
   latestComments: Array<typeof issueComments.$inferSelect>;
   costCents: number;
+  infrastructureTerminatedRunCount: number;
+  infrastructureTerminationCodes: string[];
+  contentionSuspected: boolean;
+  /** Sampled terminal runs whose comment attempts were refused (AND-29). */
+  commentDeniedRunCount: number;
+  commentDenialCount: number;
+  commentDenialCodes: string[];
+  commentChannelRefused: boolean;
+  /**
+   * The pattern has a platform explanation -- contention or a refused comment
+   * channel. The review is still filed (see `isSoftStopTrigger`'s caller), but
+   * it must not stop the assignee for something the assignee did not do.
+   */
+  infrastructureExplained: boolean;
   usageSamples: Array<{ runId: string; usageJson: Record<string, unknown> | null }>;
   nextAction: string | null;
   thresholds: ProductivityReviewThresholds;
@@ -458,6 +500,7 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
         createdAt: heartbeatRuns.createdAt,
         nextAction: heartbeatRuns.nextAction,
         usageJson: heartbeatRuns.usageJson,
+        errorCode: heartbeatRuns.errorCode,
       })
       .from(heartbeatRuns)
       .where(
@@ -491,11 +534,60 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     const terminalRuns = latestRuns.filter((run) =>
       TERMINAL_RUN_STATUSES.includes(run.status as (typeof TERMINAL_RUN_STATUSES)[number]),
     );
+
+    // AND-29: a comment the guard refused never reaches `issueComments`, so the
+    // streak below has to read the refusals directly or it counts a silenced
+    // agent as a silent one.
+    const oldestSampledRunAt = latestRuns.length > 0
+      ? latestRuns[latestRuns.length - 1]!.createdAt
+      : now;
+    const commentDenialRows = latestRuns.length > 0
+      ? await db
+        .select({
+          runId: activityLog.runId,
+          createdAt: activityLog.createdAt,
+          details: activityLog.details,
+        })
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.companyId, sourceIssue.companyId),
+            eq(activityLog.action, ISSUE_WRITE_DENIED_ACTIVITY),
+            eq(activityLog.entityType, "issue"),
+            eq(activityLog.entityId, sourceIssue.id),
+            eq(activityLog.agentId, sourceAgent.id),
+            gte(activityLog.createdAt, oldestSampledRunAt),
+          ),
+        )
+        .then((rows) => rows.filter((row) => row.details?.channel === COMMENT_DENIAL_CHANNEL))
+      : [];
+    const commentDenialsByRun = attributeIssueWriteDenialsToRuns(
+      latestRuns,
+      commentDenialRows.map((row) => ({
+        carriedRunId: typeof row.details?.carriedRunId === "string"
+          ? row.details.carriedRunId
+          : row.runId,
+        createdAt: row.createdAt,
+      })),
+    );
+    const commentDenialCodes = [
+      ...new Set(
+        commentDenialRows
+          .map((row) => row.details?.code)
+          .filter((code): code is string => typeof code === "string"),
+      ),
+    ];
+
     let noCommentStreak = 0;
     for (const run of terminalRuns) {
       if (commentRunIds.has(run.id)) break;
+      // A run whose comment was refused did speak; the channel was closed, and
+      // that is not the thing `no_comment_streak` exists to catch.
+      if (commentDenialsByRun.has(run.id)) break;
       noCommentStreak += 1;
     }
+    const commentDeniedRunCount = terminalRuns.filter((run) => commentDenialsByRun.has(run.id)).length;
+    const commentDenialCount = commentDenialRows.length;
 
     const [
       runCountLastHour,
@@ -543,6 +635,26 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       ? Math.max(0, now.getTime() - activeStartedAt.getTime())
       : null;
 
+    const infrastructureTerminationCodes = [
+      ...new Set(
+        terminalRuns
+          .map((run) => run.errorCode)
+          .filter((code): code is string => Boolean(code) && INFRASTRUCTURE_TERMINATION_ERROR_CODES.has(code!)),
+      ),
+    ];
+    const infrastructureTerminatedRunCount = terminalRuns.filter(
+      (run) => run.errorCode && INFRASTRUCTURE_TERMINATION_ERROR_CODES.has(run.errorCode),
+    ).length;
+    // Zero cost is the corroborating half: a run that was killed before it
+    // could bill anything did no work to be inefficient at.
+    const contentionSuspected =
+      infrastructureTerminatedRunCount >= CONTENTION_SUSPECTED_MIN_RUNS && costRow.costCents === 0;
+    // No cost corroboration here on purpose: these runs succeeded and billed
+    // normally. A refusal is direct evidence of an attempt, not a symptom that
+    // needs a second signal to be believed.
+    const commentChannelRefused = commentDeniedRunCount > 0;
+    const infrastructureExplained = contentionSuspected || commentChannelRefused;
+
     const noComment = noCommentStreak >= thresholds.noCommentStreakRuns;
     const longActive = elapsedMs !== null && elapsedMs >= thresholds.longActiveMs;
     const highChurn =
@@ -559,6 +671,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (highChurn) {
       triggerReasons.push(
         `${runCountLastHour} runs/${assigneeRunCommentCountLastHour} assignee-run comments in 1h; ${runCountLastSixHours} runs/${assigneeRunCommentCountLastSixHours} assignee-run comments in 6h`,
+      );
+    }
+    if (commentChannelRefused) {
+      triggerReasons.push(
+        `the comment channel was refused, not idle: ${commentDenialCount} comment write${commentDenialCount === 1 ? "" : "s"} across ${commentDeniedRunCount} of ${terminalRuns.length} sampled terminal runs were denied with ${commentDenialCodes.map((code) => `\`${code}\``).join(", ")}`,
+      );
+    }
+    if (contentionSuspected) {
+      triggerReasons.push(
+        `likely infrastructure contention, not agent inefficiency: ${infrastructureTerminatedRunCount} of ${terminalRuns.length} sampled terminal runs ended with ${infrastructureTerminationCodes.map((code) => `\`${code}\``).join(", ")} and the issue billed 0 cents`,
       );
     }
 
@@ -580,6 +702,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       latestRuns: latestRuns.slice(0, 5),
       latestComments,
       costCents: costRow.costCents,
+      infrastructureTerminatedRunCount,
+      infrastructureTerminationCodes,
+      contentionSuspected,
+      commentDeniedRunCount,
+      commentDenialCount,
+      commentDenialCodes,
+      commentChannelRefused,
+      infrastructureExplained,
       usageSamples: latestRuns
         .filter((run) => run.usageJson)
         .slice(0, 3)
@@ -659,6 +789,29 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Runs in rolling windows: ${evidence.runCountLastHour}/1h, ${evidence.runCountLastSixHours}/6h`,
       `- Assignee run-linked comments total/window: ${evidence.commentCount} total, ${evidence.commentCountLastHour}/1h, ${evidence.commentCountLastSixHours}/6h`,
       `- Cost events total: ${evidence.costCents} cents`,
+      `- Infrastructure-terminated sampled runs: ${evidence.infrastructureTerminatedRunCount} of ${evidence.terminalRunCount}`
+        + (evidence.infrastructureTerminationCodes.length > 0
+          ? ` (${evidence.infrastructureTerminationCodes.map((code) => `\`${code}\``).join(", ")})`
+          : ""),
+      `- Sampled terminal runs whose comment writes were denied: ${evidence.commentDeniedRunCount} of ${evidence.terminalRunCount}`
+        + (evidence.commentDenialCodes.length > 0
+          ? ` (${evidence.commentDenialCount} denial${evidence.commentDenialCount === 1 ? "" : "s"}: ${evidence.commentDenialCodes.map((code) => `\`${code}\``).join(", ")})`
+          : ""),
+      ...(evidence.commentChannelRefused
+        ? [
+            "- **Read this as a closed channel, not silence.** The assignee attempted issue comments and the"
+              + " write guard refused them, so nothing was persisted for the no-comment streak to see. Fix the"
+              + " denial first (the codes above name the boundary); there is no assignee behaviour to correct"
+              + " until the channel is open.",
+          ]
+        : []),
+      ...(evidence.contentionSuspected
+        ? [
+            "- **Read this as contention, not underperformance.** The sampled runs were stopped by the"
+              + " platform (server restart, signal, or lost process) and billed 0 cents, so there is no"
+              + " agent behaviour to correct here. Investigate the scheduler/restart source first.",
+          ]
+        : []),
       `- Current next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 500) : "none recorded"}`,
       "",
       "## Thresholds",
@@ -682,6 +835,14 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       "",
       "## Manager Decision",
       "",
+      ...(evidence.infrastructureExplained
+        ? [
+            "- This review was filed but does **not** hold the assignee: the continuation soft-stop is waived"
+              + " while a platform explanation is on the evidence, so the assignee keeps running while someone"
+              + " chases the cause.",
+            "",
+          ]
+        : []),
       "- Close as productive if this pattern is expected.",
       "- Continue with a snooze window if the current work should keep running without repeat review spam.",
       "- Request decomposition, reroute, block with an unblock owner, or stop/cancel the source work if the work is inefficient.",
@@ -696,6 +857,16 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
       `- Trigger: \`${evidence.trigger}\` (${formatTrigger(evidence.trigger)})`,
       `- Reasons: ${evidence.triggerReasons.join("; ")}`,
       `- No-comment streak: ${evidence.noCommentStreak}`,
+      ...(evidence.commentChannelRefused
+        ? [
+            `- Comment channel refused: ${evidence.commentDenialCount} denied comment write(s) across ${evidence.commentDeniedRunCount} run(s)`,
+          ]
+        : []),
+      ...(evidence.contentionSuspected
+        ? [
+            `- Contention suspected: ${evidence.infrastructureTerminatedRunCount} infrastructure-terminated runs, 0 cents billed`,
+          ]
+        : []),
       `- Runs/assignee comments: ${evidence.runCountLastHour}/${evidence.commentCountLastHour} in 1h, ${evidence.runCountLastSixHours}/${evidence.commentCountLastSixHours} in 6h`,
       `- Next action: ${evidence.nextAction ? truncateInline(evidence.nextAction, 300) : "none recorded"}`,
     ].join("\n");
@@ -955,6 +1126,13 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
     if (sourceAgent.companyId !== input.companyId) return { held: false as const };
     const evidence = await collectEvidence(sourceIssue, sourceAgent, thresholds, now);
     if (!evidence || !isSoftStopTrigger(evidence.trigger)) return { held: false as const };
+    // AND-29 gap 1, decided: label *and* file, but never hold. Suppressing the
+    // review entirely would hide a real incident -- somebody has to chase the
+    // restart source or the 403 loop, and an unfiled review chases nothing. But
+    // the soft stop is the punitive half: it stops the assignee from continuing
+    // work it is not responsible for failing at. When the evidence carries a
+    // platform explanation, the review stands and the hold is waived.
+    if (evidence.infrastructureExplained) return { held: false as const };
     return {
       held: true as const,
       reviewIssueId: openReview.id,
