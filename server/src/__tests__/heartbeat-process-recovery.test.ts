@@ -3006,6 +3006,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments).toHaveLength(0);
   });
 
+  it("does not demote an issue whose pending wake interaction outlived the lost run", async () => {
+    // AND-11: a board card with a wake continuation policy is a live execution
+    // path. The stranded-issue sweep already honours it; immediate terminal-run
+    // recovery must agree, or a card that outlives a process restart is read as
+    // "no execution path" and the waiting issue is demoted to blocked.
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      title: "Which recovery path should this issue take?",
+      createdByAgentId: agentId,
+      payload: { version: 1, questions: [] },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // Waiting on the card, not blocked, and the checkout lock is still released.
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+
+    // No recovery run, no stranded-recovery issue, no blocked notice comment.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe("failed");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(0);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    // The card itself is untouched, so answering it still wakes the assignee.
+    const interactions = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, issueId));
+    expect(interactions).toHaveLength(1);
+    expect(interactions[0]?.status).toBe("pending");
+  });
+
   it("schedules a bounded retry for codex transient upstream failures instead of blocking the issue immediately", async () => {
     mockAdapterExecute.mockResolvedValueOnce({
       exitCode: 1,

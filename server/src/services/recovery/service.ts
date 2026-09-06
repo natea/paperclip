@@ -36,6 +36,7 @@ import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { budgetService } from "../budgets.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
+import { hasPendingWakeInteraction as hasPendingWakeInteractionFor } from "./pending-wake-interaction.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
@@ -822,21 +823,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return Boolean(run || deferredWake);
   }
 
-  async function hasPendingWakeInteraction(companyId: string, issueId: string) {
-    return db
-      .select({ id: issueThreadInteractions.id })
-      .from(issueThreadInteractions)
-      .where(
-        and(
-          eq(issueThreadInteractions.companyId, companyId),
-          eq(issueThreadInteractions.issueId, issueId),
-          eq(issueThreadInteractions.status, "pending"),
-          inArray(issueThreadInteractions.continuationPolicy, ["wake_assignee", "wake_assignee_on_accept"]),
-        ),
-      )
-      .limit(1)
-      .then((rows) => Boolean(rows[0]));
-  }
+  const hasPendingWakeInteraction = (companyId: string, issueId: string) =>
+    hasPendingWakeInteractionFor(db, companyId, issueId);
 
   async function hasPersistedDurableWaitPath(issue: typeof issues.$inferSelect) {
     if (issue.monitorNextCheckAt) return true;

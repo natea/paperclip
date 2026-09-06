@@ -341,6 +341,7 @@ import {
   readContinuationAttempt,
 } from "./recovery/index.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./recovery/pause-hold-guard.js";
+import { hasPendingWakeInteraction } from "./recovery/pending-wake-interaction.js";
 import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
@@ -22658,6 +22659,12 @@ export function heartbeatService(
           .then((rows) => rows[0] ?? null);
 
       const issueHasPersistedMonitor = Boolean(issue.monitorNextCheckAt);
+      // A pending board card with a wake continuation policy is a live
+      // execution path: answering (or rejecting) it wakes the assignee. The
+      // stranded-issue sweep already honours it, so immediate recovery must
+      // too, or a card that outlives a process restart demotes the issue.
+      const findPendingWakeInteractionPath = () =>
+        hasPendingWakeInteraction(tx, issue.companyId, issue.id);
       const findExplicitBlockerPath = () =>
         tx
           .select({ id: issueRelations.issueId })
@@ -22697,6 +22704,7 @@ export function heartbeatService(
           options.suppressImmediateRecovery ||
           existingReviewParticipantExecutionPath ||
           issueHasPersistedMonitor ||
+          (await findPendingWakeInteractionPath()) ||
           (await isAutomaticRecoverySuppressedByPauseHold(
             db,
             issue.companyId,
@@ -22837,6 +22845,7 @@ export function heartbeatService(
       if (
         existingExecutionPath ||
         issueHasPersistedMonitor ||
+        (await findPendingWakeInteractionPath()) ||
         (await findExplicitBlockerPath())
       ) {
         return { kind: "released" as const };
