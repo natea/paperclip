@@ -734,7 +734,11 @@ describe("P6-25 persisted reaper-to-finalization recovery", () => {
     expect(staleProviderProcess.pid).toEqual(expect.any(Number));
     await db.update(heartbeatRuns).set({
       processPid: staleProviderProcess.pid!,
-      processStartedAt: new Date("2026-08-09T04:00:00.000Z"),
+      // The child was just forked, so "now" is its real start time. Liveness
+      // compares this against the OS-reported start time for the pid, and a
+      // fabricated clock here would read as a recycled pid rather than as the
+      // live unowned process this test is about (AND-40).
+      processStartedAt: new Date(),
     }).where(eq(heartbeatRuns.id, runId));
     const backendFactory = vi.fn(() => backend);
     const heartbeat = heartbeatService(db, {
