@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "@paperclipai/adapter-cursor-local/server";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 async function writeFakeCursorCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
+  const script = `const fs = require("node:fs");
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
@@ -37,13 +37,11 @@ console.log(JSON.stringify({
   result: "ok",
 }));
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 async function writeFakeSandboxCursorAgent(commandPath: string, capturePath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
+  const script = `const fs = require("node:fs");
 
 const payload = {
   command: process.argv[1],
@@ -69,9 +67,11 @@ console.log(JSON.stringify({
   result: "ok",
 }));
 `;
-  await fs.mkdir(path.dirname(commandPath), { recursive: true });
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  // The sandbox runner replaces the child environment wholesale (`env: input.env
+  // ?? {}`) and the adapter builds a narrow PATH, so an `#!/usr/bin/env node`
+  // fixture resolves against *that* PATH and exits 127 on any host whose Node
+  // lives outside it — AND-62. Pin the interpreter.
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 function createLocalSandboxRunner() {
