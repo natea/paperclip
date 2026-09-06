@@ -150,29 +150,54 @@ oldest workspace when no primary is set. A project with workspaces but no
 primary would place runs in a checkout the guard could not see. It now takes
 the same four hops the run resolver takes (see above), so the two agree.
 
-## What AND-77 could and could not settle
+## Why the guard was silent on AND-74 (AND-77)
 
-AND-77 reported two closes ~1 minute apart on the same repo, branch, gap, and
-project: AND-76 (18:24:42) flagged, AND-74 (18:25:38, and again at 18:27:10)
-did not. What the evidence supports:
+AND-77 reported two closes ~1 minute apart on the same repo, branch, gap and
+project, where AND-76 (18:24:42) flagged and AND-74 (18:25:38, again 18:27:10)
+did not. The cause was not in the guard.
 
-- **Ruled out: the post-update issue object dropping a `projectId` it did not
-  change.** This was the leading hypothesis — AND-74's `projectId` was set by a
-  mid-session PATCH, AND-76's at creation. The route test
-  `"still resolves the repo when projectId was set by an earlier PATCH"`
-  reproduces that exact shape and the guard fires normally. `svc.update`
-  returns the full updated row, not a patch-shaped delta.
-- **Explains the 18:25:38 close: a push race.** The fork ref reflog shows
-  `refs/remotes/fork/platform/run-lifecycle-stability` updated to `eae373d0e`
-  at 14:25:40 -0400 — a second or so *after* the close began, and the guard
-  runs after the update commits. A `clean` probe there was correct, not a miss.
-- **Unsettled: the 18:27:10 re-test.** HEAD was the temporary empty commit
-  `5c7a099f1` and the fork ref was `eae373d0e`, so a gap of 1 was real at that
-  instant and the guard should have flagged it. The old guard recorded nothing
-  on a non-gap outcome, so there is no record to read and no way to distinguish
-  a starved git call from a resolution miss after the fact.
+**Two server processes were serving the same database on two ports, from two
+different vintages of this repo.**
 
-That last bullet is the whole argument for the observability landing first: the
-next occurrence leaves a `probeReason` behind. Note the deployment precondition
-— the running server must be rebuilt and restarted onto this commit before any
-of the new records appear.
+| | pid 82953 | pid 64484 (was 35348) |
+| --- | --- | --- |
+| port | **3100** | **3101** |
+| started | 00:50:24 | reloaded by `tsx watch` on every source change |
+| parent | `1` — orphaned, never reloads | the `dev-runner.ts watch` supervisor |
+| AND-73 guard (landed 12:41) | **absent** | present |
+| AND-69 `serverInfo.freshness` (landed 11:13) | **absent** from `/api/health` | `status: "current"` |
+
+`PAPERCLIP_API_URL` for the CTO is `http://backlit.local:3100` — the orphaned
+process. The Chief of Staff's closes reached 3101. Same issues, same database,
+same board; two code vintages, decided by which port the agent was handed.
+
+Verified by A/B on one throwaway issue, reopened and re-closed against each
+port seconds apart with an identical working tree:
+
+- `PATCH :3101 {status: done}` → `pushStateProbe: { kind: "clean", branch:
+  "platform/run-lifecycle-stability", remoteRef: "fork/platform/run-lifecycle-stability" }`
+- `PATCH :3100 {status: done}` → no `pushStateProbe`, no `pushStateWarning`, no
+  activity row. The guard is not in that binary.
+
+Two corollaries worth keeping:
+
+- **`/api/health`'s top-level `commit` is not evidence about the running
+  process.** It is read live from the checkout — deliberately, per
+  `server-info.ts` — so pid 82953 reports `1310dfe43` while running code from
+  fourteen hours earlier. The field that *does* answer the question is
+  `serverInfo.freshness` (AND-69), and its **absence** from a `/api/health`
+  response is itself the tell: a process old enough to lack the drift reporter
+  cannot report its own drift.
+- **The 18:25:38 close was additionally a push race**, independent of the above.
+  The fork reflog shows `refs/remotes/fork/platform/run-lifecycle-stability`
+  updated to `eae373d0e` at 14:25:40 -0400, a second *after* that close began.
+  A `clean` probe there would have been correct.
+
+Ruled out along the way, and worth not re-testing: the post-update issue object
+does **not** drop a `projectId` set by an earlier PATCH. `svc.update` returns
+the full updated row, and the route test `"still resolves the repo when
+projectId was set by an earlier PATCH"` pins that.
+
+The residual is operational, not code: an orphaned server process serving stale
+code on the port agents are pointed at. Nothing in the control plane detects or
+refuses that today.
