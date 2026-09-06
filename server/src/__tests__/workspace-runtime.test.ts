@@ -366,6 +366,52 @@ async function findFreePort() {
   return port;
 }
 
+// macOS hands out ephemeral ports from a single machine-wide cursor that walks
+// `net.inet.ip.portrange.first` -> `.last` (49152 -> 65535) in order, rather
+// than picking randomly. Several tests need a port that is <= 55535 and outside
+// the broker's dedicated 42000-42999 allowlist, and they used to get one by
+// asking for an ephemeral port and retrying when it fell outside that window.
+// That is not a race and more retries do not help: once the shared cursor has
+// walked past 55535 -- which it does routinely on a dev box also running live
+// dev-watch -- *every* attempt lands out of range and the loop throws
+// "Failed to reserve ... outside the broker range" deterministically until the
+// cursor wraps. Bind an explicit candidate inside the wanted window instead, so
+// reservation depends on that port being free rather than on where a global
+// counter happens to be sitting.
+const BROKER_RESERVED_PORT_RANGE = { first: 42_000, last: 42_999 } as const;
+const TEST_PORT_WINDOW = { first: 20_000, last: 55_535 } as const;
+
+function isPortOutsideBrokerRange(port: number): boolean {
+  return (
+    port <= TEST_PORT_WINDOW.last &&
+    (port < BROKER_RESERVED_PORT_RANGE.first || port > BROKER_RESERVED_PORT_RANGE.last)
+  );
+}
+
+async function reservePortOutsideBrokerRange(): Promise<number> {
+  const span = TEST_PORT_WINDOW.last - TEST_PORT_WINDOW.first + 1;
+  for (let attempt = 0; attempt < 200; attempt += 1) {
+    const candidate = TEST_PORT_WINDOW.first + Math.floor(Math.random() * span);
+    if (!isPortOutsideBrokerRange(candidate)) continue;
+    try {
+      const server = await listenOnPort(candidate);
+      await closeNetServer(server);
+      return candidate;
+    } catch {
+      // Port is occupied; draw another candidate.
+    }
+  }
+  // Last resort: an ephemeral port may still satisfy the constraint if the
+  // kernel cursor is currently below the ceiling.
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const port = await findFreePort();
+    if (isPortOutsideBrokerRange(port)) return port;
+  }
+  throw new Error(
+    `Failed to reserve a test port in ${TEST_PORT_WINDOW.first}-${TEST_PORT_WINDOW.last} outside the broker range ${BROKER_RESERVED_PORT_RANGE.first}-${BROKER_RESERVED_PORT_RANGE.last}`,
+  );
+}
+
 async function reserveContiguousPorts(count: number) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const basePort = await findFreePort();
@@ -7365,7 +7411,16 @@ describeEmbeddedPostgres("workspace runtime service control persistence", () => 
       await cleanupRuntimeHome();
       await fixture.cleanup();
     }
-  }, 20_000);
+    // 60s, not 20s. This case deliberately drives port allocation to
+    // exhaustion: it stubs `lsof` to always fail so listener ownership can
+    // never be proven, which forces the allocator through all
+    // WORKSPACE_RUNTIME_PORT_ALLOCATION_ATTEMPTS (32) iterations, each
+    // spawning a subprocess. Measured cost on an idle box is ~15.9s, so the
+    // old 20s budget left only a 1.26x margin and any concurrent load --
+    // notably a live dev-watch on the same machine -- tipped it into a timeout
+    // that read as a flaky assertion rather than a spawn-bound loop running
+    // out of clock. The assertion is unchanged; only the allowance is.
+  }, 60_000);
 
   it("returns a bounded structured conflict and exposes only same-company workspace references", async () => {
     const fixture = await createRuntimeFixture({
@@ -7744,19 +7799,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     process.env.PAPERCLIP_HOME = paperclipHome;
     process.env.PAPERCLIP_INSTANCE_ID = `runtime-https-backfill-${randomUUID()}`;
 
-    const reservePort = async () => {
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        const probe = net.createServer();
-        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-        const address = probe.address();
-        const port = typeof address === "object" && address ? address.port : null;
-        await new Promise<void>((resolve, reject) => {
-          probe.close((error) => error ? reject(error) : resolve());
-        });
-        if (port && port <= 55_535 && (port < 42_000 || port > 42_999)) return port;
-      }
-      throw new Error("Failed to reserve an HTTPS backfill test port outside the broker range");
-    };
+    const reservePort = reservePortOutsideBrokerRange;
     const isLoopbackPortFree = async (port: number) => {
       const probe = net.createServer();
       return await new Promise<boolean>((resolve) => {
@@ -8085,21 +8128,7 @@ describeEmbeddedPostgres("workspace runtime startup reconciliation", () => {
     // The reconciler stores this port on the row. A port inside that range makes
     // the reconciler treat the row as an exposure reservation and report drift,
     // so the live service never reaches the adoption path this test verifies.
-    const reservePort = async () => {
-      for (let attempt = 0; attempt < 100; attempt += 1) {
-        const probe = net.createServer();
-        await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
-        const address = probe.address();
-        const candidate = typeof address === "object" && address ? address.port : null;
-        await new Promise<void>((resolve, reject) => {
-          probe.close((error) => error ? reject(error) : resolve());
-        });
-        if (candidate && candidate <= 55_535 && (candidate < 42_000 || candidate > 42_999)) {
-          return candidate;
-        }
-      }
-      throw new Error("Failed to reserve pnpm reconciliation test port outside the broker range");
-    };
+    const reservePort = reservePortOutsideBrokerRange;
     const port = await reservePort();
 
     const companyId = randomUUID();
