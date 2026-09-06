@@ -1,0 +1,24 @@
+diff --git a/server/src/index.ts b/server/src/index.ts
+index d35563665..4b63c736e 100644
+--- a/server/src/index.ts
++++ b/server/src/index.ts
+@@ -34,6 +34,7 @@ import {
+ import detectPort from "detect-port";
+ import { createApp } from "./app.js";
+ import { loadConfig } from "./config.js";
++import { reportDevWatchStaleness } from "./dev-watch-staleness.js";
+ import { logger } from "./middleware/logger.js";
+ import {
+   StartupRefusalError,
+@@ -156,6 +157,11 @@ export interface StartedServer {
+ 
+ export async function startServer(): Promise<StartedServer> {
+   warnIfUnsupportedNodeVersion(process.versions.node, (message) => logger.warn(message));
++  // AND-30: the dev-watch wrapper reads its config once at start and `tsx
++  // watch` never re-executes it, so a wrapper left running from before a
++  // dev-watch change keeps the old behaviour indefinitely. Say so at boot
++  // rather than letting a stale wrapper silently interrupt agent runs.
++  reportDevWatchStaleness((payload, message) => logger.warn(payload, message));
+ 
+   // Tracing must be active (or have failed and logged) before the first DB
+   // connection or the HTTP server exists — see instrumentation.ts.
