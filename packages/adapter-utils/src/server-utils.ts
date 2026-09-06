@@ -60,6 +60,40 @@ export interface RunProcessResult {
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
 }
 
+/**
+ * The typed error code an adapter reports when the provider process was killed
+ * by a signal rather than failing on its own. A process-group SIGTERM (server
+ * shutdown, dev-watch restart, operator cancel) is an infrastructure event, not
+ * a provider or agent failure, and the two must not share a disposition: the
+ * provider heuristics run over the truncated stdout+stderr of a killed process
+ * and mislabel the kill as an auth or upstream fault, which then sends recovery
+ * and productivity review chasing a problem that never happened.
+ */
+export const PROCESS_SIGNAL_TERMINATED_ERROR_CODE = "process_signal_terminated";
+
+/**
+ * Shell exit codes that encode a fatal signal as 128 + N. A signal delivered to
+ * a CLI behind a shell wrapper reaches the caller as one of these codes rather
+ * than as `signal`, so both shapes have to be recognised: SIGINT (130),
+ * SIGKILL (137), SIGTERM (143).
+ */
+const PROCESS_SIGNAL_TERMINATION_EXIT_CODES = new Set([130, 137, 143]);
+
+/**
+ * True when the OS killed this process. A timeout is deliberately excluded: the
+ * runner kills a timed-out process itself and already reports the typed timeout
+ * disposition, which carries more information than "something signalled us".
+ */
+export function isProcessSignalTerminated(
+  proc: Pick<RunProcessResult, "signal" | "exitCode" | "timedOut">,
+): boolean {
+  if (proc.timedOut) return false;
+  return (
+    proc.signal != null ||
+    PROCESS_SIGNAL_TERMINATION_EXIT_CODES.has(proc.exitCode ?? -1)
+  );
+}
+
 export interface TerminalResultCleanupOptions {
   hasTerminalResult: (output: { stdout: string; stderr: string }) => boolean;
   graceMs?: number;
