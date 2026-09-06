@@ -430,6 +430,7 @@ import {
   type HotRestartIntentRun,
   type HotRestartReportRun,
 } from "./hot-restart.js";
+import { isPidOwnedByRecordedStart } from "./process-liveness.js";
 import {
   assertLowTrustRuntimeServicesAllowed,
   assertLowTrustWorkspaceIsolation,
@@ -7649,21 +7650,25 @@ export function buildPaperclipTaskMarkdown(input: {
   return lines.join("\n");
 }
 
-// A positive liveness check means some process currently owns the PID.
-// On Linux, PIDs can be recycled, so this is a best-effort signal rather
-// than proof that the original child is still alive.
-function isProcessAlive(pid: number | null | undefined) {
+// A positive signal-0 probe means some process currently owns the PID -- not
+// that it is the child we spawned, because PIDs are recycled across a reboot or
+// a wraparound. When the spawn site recorded a start time we compare it against
+// the start time the OS reports for the PID, which turns "some process holds
+// this number" into "our process is still alive". Callers that have no recorded
+// start time keep the old best-effort behaviour; see process-liveness.ts.
+async function isProcessAlive(
+  pid: number | null | undefined,
+  recordedStartedAt?: Date | string | null,
+) {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0)
     return false;
   try {
     process.kill(pid, 0);
-    return true;
   } catch (error) {
     const code = (error as NodeJS.ErrnoException | undefined)?.code;
-    if (code === "EPERM") return true;
-    if (code === "ESRCH") return false;
-    return false;
+    if (code !== "EPERM") return false;
   }
+  return isPidOwnedByRecordedStart({ pid, recordedStartedAt });
 }
 
 export async function persistHeartbeatRunProcessMetadata(
@@ -12739,7 +12744,10 @@ export function heartbeatService(
 
       const processPid = run.processPid ?? candidate.processPid;
       const processGroupId = run.processGroupId ?? candidate.processGroupId;
-      const processPidAlive = isProcessAlive(processPid);
+      const processPidAlive = await isProcessAlive(
+        processPid,
+        run.processStartedAt,
+      );
       const processGroupAlive = isProcessGroupAlive(processGroupId);
       if (!processPid && !processGroupId) {
         classify(candidate, "lost", "missing_process_metadata", patch);
@@ -12918,7 +12926,7 @@ export function heartbeatService(
         run.processPid !== null &&
         run.processGroupId !== null &&
         run.processPid === run.processGroupId &&
-        isProcessAlive(run.processPid)
+        (await isProcessAlive(run.processPid, run.processStartedAt))
       ) {
         runningProcesses.delete(run.id);
         preservedRunIds.push(run.id);
@@ -16665,7 +16673,8 @@ export function heartbeatService(
         continue;
       }
       const processPidAlive =
-        !!run.processPid && isProcessAlive(run.processPid);
+        !!run.processPid &&
+        (await isProcessAlive(run.processPid, run.processStartedAt));
       const processGroupAlive =
         !!run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (processPidAlive || processGroupAlive) {
@@ -16854,7 +16863,9 @@ export function heartbeatService(
     } of activeRuns) {
       const nativeRun = run.runtimeMode === "native";
       const nativeProcessPidAlive =
-        nativeRun && !!run.processPid && isProcessAlive(run.processPid);
+        nativeRun &&
+        !!run.processPid &&
+        (await isProcessAlive(run.processPid, run.processStartedAt));
       const nativeProcessGroupAlive =
         nativeRun &&
         !!run.processGroupId &&
@@ -16911,8 +16922,8 @@ export function heartbeatService(
         currentAdapterTracksLocalChild || run.runtimeMode === "native";
       const processPidAlive =
         checksPersistedChildLiveness &&
-        run.processPid &&
-        isProcessAlive(run.processPid);
+        !!run.processPid &&
+        (await isProcessAlive(run.processPid, run.processStartedAt));
       const processGroupAlive =
         checksPersistedChildLiveness &&
         run.processGroupId &&
@@ -17532,12 +17543,15 @@ export function heartbeatService(
         tracked.child.signalCode === null;
       const trackedPid = tracked?.child.pid ?? null;
       const trackedProcessGroupId = tracked?.processGroupId ?? null;
-      const trackedPidAlive = trackedPid ? isProcessAlive(trackedPid) : false;
+      const trackedPidAlive = trackedPid
+        ? await isProcessAlive(trackedPid)
+        : false;
       const trackedProcessGroupAlive = trackedProcessGroupId
         ? isProcessGroupAlive(trackedProcessGroupId)
         : false;
       const persistedPidAlive =
-        !!run.processPid && isProcessAlive(run.processPid);
+        !!run.processPid &&
+        (await isProcessAlive(run.processPid, run.processStartedAt));
       const persistedProcessGroupAlive =
         !!run.processGroupId && isProcessGroupAlive(run.processGroupId);
       if (

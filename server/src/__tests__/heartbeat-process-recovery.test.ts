@@ -122,6 +122,7 @@ import {
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
   writeHotRestartIntent,
+  writeHotRestartShutdownSnapshot,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
 import {
@@ -2226,6 +2227,134 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         mode: "reported",
         adoptedRunIds: [runId],
         finalizedWhileDownRunIds: [],
+        lostRunIds: [],
+      });
+    });
+  });
+
+  it("does not adopt a run whose recorded spawn time disagrees with the live pid", async () => {
+    // Regression (AND-40): liveness was `process.kill(pid, 0)` alone, so after a
+    // reboot or a pid wraparound an unrelated process holding the recycled pid
+    // got a dead run classified as adopted -- and the adopted run kept holding
+    // its issue's execution lock with nothing behind it.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeGreaterThan(0);
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      agentStatus: "running",
+    });
+
+    // The recorded spawn time is hours before this child was forked: same pid,
+    // different process.
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: child.pid ?? 0,
+      processGroupId: null,
+      startedAt: "2026-03-19T00:01:00.000Z",
+    });
+
+    await withTempPaperclipHome(async (home) => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-08-01T00:05:00.000Z"),
+        preflightActiveRunIds: [runId],
+      });
+      const intent = await readHotRestartIntent();
+      if (!intent) throw new Error("hot-restart intent was not written");
+      await writeHotRestartShutdownSnapshot({
+        intent,
+        signal: "SIGTERM",
+        capturedAt: new Date("2026-08-01T00:06:00.000Z"),
+        activeRuns: [
+          {
+            runId,
+            companyId,
+            agentId,
+            adapterType: "codex_local",
+            status: "running",
+            processPid: child.pid ?? null,
+            processGroupId: null,
+            issueId,
+          },
+        ],
+      });
+
+      const heartbeat = heartbeatService(db);
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-08-01T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [],
+        finalizedWhileDownRunIds: [],
+        lostRunIds: [runId],
+      });
+
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as { runs?: Array<Record<string, unknown>> };
+      expect(report.runs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            runId,
+            classification: "lost",
+            reason: "process_not_alive",
+          }),
+        ]),
+      );
+    });
+
+    // The unrelated pid holder is untouched -- we reclassified our own run, we
+    // did not signal somebody else's process.
+    expect(isPidAlive(child.pid)).toBe(true);
+  });
+
+  it("still adopts a run whose recorded spawn time matches the live pid", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      agentStatus: "running",
+    });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: child.pid ?? 0,
+      processGroupId: null,
+      startedAt: new Date().toISOString(),
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-08-01T00:05:00.000Z"),
+        preflightActiveRunIds: [runId],
+      });
+      const intent = await readHotRestartIntent();
+      if (!intent) throw new Error("hot-restart intent was not written");
+      await writeHotRestartShutdownSnapshot({
+        intent,
+        signal: "SIGTERM",
+        capturedAt: new Date("2026-08-01T00:06:00.000Z"),
+        activeRuns: [
+          {
+            runId,
+            companyId,
+            agentId,
+            adapterType: "codex_local",
+            status: "running",
+            processPid: child.pid ?? null,
+            processGroupId: null,
+            issueId,
+          },
+        ],
+      });
+
+      const adoption = await heartbeatService(db).reconcileHotRestartAdoption(
+        new Date("2026-08-01T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [runId],
         lostRunIds: [],
       });
     });
