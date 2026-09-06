@@ -130,7 +130,8 @@ vi.mock("../services/projects.js", () => ({
   projectService: () => projectSvc,
 }));
 
-vi.mock("../services/issues.js", () => ({
+vi.mock("../services/issues.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/issues.js")>()),
   issueService: () => issueSvc,
 }));
 

@@ -41,7 +41,8 @@ function registerRouteMocks() {
     getTelemetryClient: vi.fn(() => ({ track: vi.fn() })),
   }));
 
-  vi.doMock("../services/issues.js", () => ({
+  vi.doMock("../services/issues.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../services/issues.js")>()),
     issueService: () => mockIssueService,
   }));
 
