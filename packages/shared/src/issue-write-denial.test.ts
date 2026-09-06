@@ -80,10 +80,68 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.description).not.toContain("attempt");
   });
 
-  it("gives the run-context denial a copy-pasteable fix", () => {
+  it("gives the run-context denial a copy-pasteable fix when no run id arrived", () => {
     const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required");
     expect(copy.sanctionedPath).toContain("X-Paperclip-Run-Id");
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
+    // AND-25: even here the variable is named as a variable to read, never
+    // emitted as an unexpanded `$`-prefixed token the caller might send verbatim.
+    expect(copy.sanctionedPath).not.toContain("$PAPERCLIP_RUN_ID");
+    expect(copy.description).toContain("without a run id");
+  });
+
+  it("never prescribes the run-id header to a caller whose id simply did not resolve", () => {
+    // AND-25: the same code fired for a scheduler-driven heartbeat that sent the
+    // header on every call. Telling it to send the header names a condition the
+    // request already met, which reads as "retry unchanged" — a guaranteed loop.
+    const runId = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required", { runId });
+    expect(copy.status).toBe(403);
+    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id");
+    expect(copy.sanctionedPath).not.toContain("$PAPERCLIP_RUN_ID");
+    // It echoes the id that failed, so the agent can see which one it sent.
+    expect(copy.sanctionedPath).toContain(runId);
+    expect(copy.description).toContain(runId);
+    expect(copy.sanctionedPath).toContain("will not");
+  });
+
+  it("leaks no unexpanded shell variable in any denial copy", () => {
+    // AND-25 defect 2: `$PAPERCLIP_RUN_ID` reached callers verbatim. Pin the
+    // whole contract, not just the one case, so it cannot come back elsewhere.
+    for (const code of ISSUE_WRITE_DENIAL_CODES) {
+      const copy = describeIssueWriteDenial(code, {
+        runId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+      });
+      for (const field of [copy.description, copy.whoCanAct, copy.sanctionedPath, copy.title]) {
+        expect(field).not.toMatch(/\$[A-Z][A-Z0-9_]*/);
+      }
+    }
+  });
+
+  it("does not repeat the run-id remedy to a caller that already sent it", () => {
+    // AND-22: a scheduler-driven heartbeat sends `X-Paperclip-Run-Id` on every
+    // call and was still told to send it. Well-formed, machine-readable and
+    // wrong is worse than a malformed error — it reads as followable, so the
+    // agent retries identically forever. This code exists to end that loop.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_not_task_bound");
+    expect(copy.status).toBe(403);
+    expect(copy.tone).toBe("boundary");
+    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id");
+    expect(copy.sanctionedPath).not.toContain("PAPERCLIP_RUN_ID");
+    // Two ways forward, and an explicit statement that retrying is not one.
+    expect(copy.sanctionedPath).toContain("checkout");
+    expect(copy.sanctionedPath).toContain("child issue");
+    expect(copy.sanctionedPath).toContain("will not succeed");
+    // And it says plainly that the header was accepted, so the agent stops
+    // suspecting its own request shape.
+    expect(copy.description).toContain("not the header");
+  });
+
+  it("keeps the two run-context denials distinguishable", () => {
+    const notBound = describeIssueWriteDenial("cross_issue_influence_run_not_task_bound");
+    const noContext = describeIssueWriteDenial("cross_issue_influence_run_context_required");
+    expect(notBound.boundary).not.toBe(noContext.boundary);
+    expect(notBound.sanctionedPath).not.toBe(noContext.sanctionedPath);
   });
 
   it("tells a spoof attempt that the write itself was fine", () => {

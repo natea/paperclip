@@ -1,9 +1,10 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, heartbeatRuns, issues } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
+import { readRunSourceIssueId } from "./run-issue-binding.js";
 
 export const CROSS_ISSUE_INFLUENCE_LIMIT = 20;
 export const CROSS_ISSUE_INFLUENCE_ENFORCE_AT = new Date("2026-08-11T00:00:00.000Z");
@@ -27,20 +28,32 @@ export type CrossIssueInfluenceDecision = {
   enforceAt: string;
 };
 
-export function crossIssueInfluenceRunContextError() {
-  // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
-  // so the agent reading this 403 is told the fix, not just the refusal.
-  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required");
+/**
+ * The run resolved, but it names no task, and the target is not a task this run
+ * owns. Distinct from `crossIssueInfluenceRunContextError` on purpose (AND-22):
+ * the run-context copy tells the caller to send `X-Paperclip-Run-Id`, which a
+ * scheduler-driven heartbeat has already done, so reusing it here hands the
+ * agent a remedy it has performed and induces an endless identical retry.
+ */
+export function crossIssueInfluenceRunNotTaskBoundError() {
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_not_task_bound");
   return forbidden(body.error, body.details);
 }
 
-function readRunSourceIssueId(contextSnapshot: unknown) {
-  if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
-  const context = contextSnapshot as Record<string, unknown>;
-  for (const candidate of [context.issueId, context.taskId]) {
-    if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
-  }
-  return null;
+/**
+ * @param carriedRunId the run id the request actually carried, when it carried
+ *   a well-formed one. AND-25: the copy branches on this so a caller that
+ *   already sent `X-Paperclip-Run-Id` is never told to send it — that remedy is
+ *   only correct for a request that sent no id at all. A malformed id is not
+ *   echoed back: it fails `isUuidLike` before it reaches here.
+ */
+export function crossIssueInfluenceRunContextError(carriedRunId?: string | null) {
+  // Copy comes from the shared issue-write denial contract (the open cross-task write design (failure UX))
+  // so the agent reading this 403 is told the fix, not just the refusal.
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_context_required", {
+    runId: carriedRunId ?? null,
+  });
+  return forbidden(body.error, body.details);
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -106,11 +119,31 @@ export async function observeCrossIssueInfluence(
       run.companyId !== input.companyId ||
       run.agentId !== input.agentId
     ) {
-      throw crossIssueInfluenceRunContextError();
+      // The header arrived and was well formed; it just did not resolve to a run
+      // owned by this agent in this company. Say so with the id, rather than
+      // asking for a header the caller demonstrably sent.
+      throw crossIssueInfluenceRunContextError(input.runId);
     }
 
-    const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    let sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
+    if (!sourceIssueId) {
+      // An unbound (scheduler-driven) run is still allowed to write to a task it
+      // holds the checkout or execution lock on: that write is self-evidently
+      // not cross-issue influence, whatever the run context forgot to say.
+      const target = await tx
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+        })
+        .from(issues)
+        .where(and(eq(issues.id, input.targetIssueId), eq(issues.companyId, input.companyId)))
+        .then((rows) => rows[0] ?? null);
+      const ownsTarget = Boolean(
+        target && (target.checkoutRunId === input.runId || target.executionRunId === input.runId),
+      );
+      if (!ownsTarget) throw crossIssueInfluenceRunNotTaskBoundError();
+      sourceIssueId = input.targetIssueId;
+    }
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
