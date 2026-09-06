@@ -28,8 +28,21 @@ describeEmbeddedPostgres("issue list parentIssueId query alias", () => {
       { id: parentId, companyId, title: "Parent", status: "todo", priority: "medium" },
       { id: otherParentId, companyId, title: "Other parent", status: "todo", priority: "medium" },
     ]);
+    // The blocked-count assertions below are about the parent filter, not about which issues
+    // happen to sit in the blocked inbox. An unassigned issue in `todo` now raises an
+    // `unassigned_without_wake_path` liveness finding of its own, which is a legitimate
+    // blocked-inbox entry and would otherwise inflate these counts for reasons unrelated to
+    // `?parentId=`. Give the non-blocked children a human owner so they stay out of it.
     await ctx.db.insert(issues).values([
-      { id: childId, companyId, title: "Child", status: "todo", priority: "medium", parentId },
+      {
+        id: childId,
+        companyId,
+        title: "Child",
+        status: "todo",
+        priority: "medium",
+        parentId,
+        assigneeUserId: company.userId,
+      },
       { id: blockedChildId, companyId, title: "Blocked child", status: "blocked", priority: "medium", parentId },
       {
         id: randomUUID(),
@@ -38,6 +51,7 @@ describeEmbeddedPostgres("issue list parentIssueId query alias", () => {
         status: "todo",
         priority: "medium",
         parentId: otherParentId,
+        assigneeUserId: company.userId,
       },
       {
         id: randomUUID(),
