@@ -90,7 +90,11 @@ import {
   reconcileAdapterAvailability,
 } from "./services/adapter-registry-bootstrap.js";
 import { createFeedbackTraceShareClientFromConfig } from "./services/feedback-share-client.js";
-import { buildRuntimeApiCandidateUrls, choosePrimaryRuntimeApiUrl } from "./runtime-api.js";
+import {
+  buildRuntimeApiCandidateUrls,
+  choosePrimaryRuntimeApiUrl,
+  probeReachableRuntimeApiUrl,
+} from "./runtime-api.js";
 import { isLoopbackHost, rewriteLoopbackUrlPort } from "./url-utils.js";
 import { createPluginWorkerManager } from "./services/plugin-worker-manager.js";
 import { createStorageServiceFromConfig } from "./storage/index.js";
@@ -1730,7 +1734,42 @@ export async function startServer(): Promise<StartedServer> {
       resolveListen();
     });
   });
-  
+
+  // AND-8: `choosePrimaryRuntimeApiUrl` derives the injected PAPERCLIP_API_URL
+  // from config alone. With `auth.baseUrlMode: "auto"` and a wildcard bind it
+  // takes `allowedHostnames[0]` verbatim, so a stale entry (a MagicDNS name
+  // that now belongs to a different, offline tailnet peer) silently hands every
+  // spawned agent a dead control-plane URL. The agent can neither read nor
+  // write the board and the run ends as a no-op indistinguishable from an idle
+  // agent. Probe the already-derived candidate list now that we are listening
+  // and pin the first origin that actually answers. The configured host is
+  // probed first, so a deliberate external URL still wins whenever it works.
+  {
+    const reachableApiUrl = await probeReachableRuntimeApiUrl({
+      candidates: runtimeApiCandidates,
+    });
+    if (!reachableApiUrl) {
+      logger.warn(
+        { candidates: runtimeApiCandidates, injectedApiUrl: configuredApiUrl },
+        "no runtime API candidate answered a health probe; agents will inherit the configured PAPERCLIP_API_URL unverified",
+      );
+    } else if (reachableApiUrl !== configuredApiUrl) {
+      logger.warn(
+        {
+          configuredApiUrl,
+          reachableApiUrl,
+          candidates: runtimeApiCandidates,
+          allowedHostnames: config.allowedHostnames,
+        },
+        "configured runtime API URL is unreachable from this host; injecting the first reachable candidate into agent runs instead",
+      );
+      process.env.PAPERCLIP_API_URL = reachableApiUrl;
+      process.env.PAPERCLIP_RUNTIME_API_URL = reachableApiUrl;
+    } else {
+      logger.info({ reachableApiUrl }, "verified runtime API URL injected into agent runs");
+    }
+  }
+
   {
     const shutdown = async (signal: "SIGINT" | "SIGTERM") => {
       await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
