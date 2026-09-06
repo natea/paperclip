@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { resetClaudeCliCapabilitiesCacheForTests, testEnvironment } from "@paperclipai/adapter-claude-local/server";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 const ORIGINAL_ANTHROPIC = process.env.ANTHROPIC_API_KEY;
 const ORIGINAL_BEDROCK = process.env.CLAUDE_CODE_USE_BEDROCK;
@@ -47,8 +48,7 @@ afterEach(() => {
 });
 
 async function writeHelpWithoutEffortClaudeCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-const argv = process.argv.slice(2);
+  const script = `const argv = process.argv.slice(2);
 if (argv.includes("--help")) {
   process.stdout.write("Usage: claude [options]\\n  --print\\n  --model <id>\\n");
   process.exit(0);
@@ -60,8 +60,7 @@ if (argv.includes("--effort")) {
 console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "hello" }] } }));
 console.log(JSON.stringify({ type: "result", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 function createLocalSandboxRunner() {
@@ -380,8 +379,7 @@ describe("claude_local environment diagnostics", () => {
     await fs.writeFile(path.join(sourceConfigDir, "CLAUDE.md"), "seed instructions", "utf8");
     await fs.writeFile(path.join(sourceConfigDir, "credentials.json"), JSON.stringify({ token: "local" }), "utf8");
     await fs.writeFile(path.join(remoteHome, ".claude", ".credentials.json"), JSON.stringify({ token: "remote" }), "utf8");
-    await fs.writeFile(commandPath, `#!/usr/bin/env node
-const fs = require("fs");
+    await writeExecutableNodeFixture(commandPath, `const fs = require("fs");
 const path = require("path");
 const configDir = process.env.CLAUDE_CONFIG_DIR || "";
 function fail(message) {
@@ -404,8 +402,7 @@ if (fs.readFileSync(path.join(configDir, "CLAUDE.md"), "utf8") !== "seed instruc
 }
 console.log(JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "hello" }] } }));
 console.log(JSON.stringify({ type: "result", result: "hello", usage: { input_tokens: 1, cache_read_input_tokens: 0, output_tokens: 1 } }));
-`, "utf8");
-    await fs.chmod(commandPath, 0o755);
+`);
 
     process.env.CLAUDE_CONFIG_DIR = sourceConfigDir;
     process.env.PAPERCLIP_HOME = path.join(root, "paperclip-home");

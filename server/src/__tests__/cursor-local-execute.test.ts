@@ -67,6 +67,7 @@ console.log(JSON.stringify({
   result: "ok",
 }));
 `;
+  // allow-env-shebang: prose, not a fixture.
   // The sandbox runner replaces the child environment wholesale (`env: input.env
   // ?? {}`) and the adapter builds a narrow PATH, so an `#!/usr/bin/env node`
   // fixture resolves against *that* PATH and exits 127 on any host whose Node

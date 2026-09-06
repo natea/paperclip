@@ -58,3 +58,56 @@ describe("executable node fixtures", () => {
     expect(stdout).toBe("ok");
   });
 });
+
+/**
+ * The sweep is only a retired class if the pattern cannot come back. `git grep`
+ * every test file for the env shebang and require each surviving occurrence to
+ * carry an explicit justification, so a new one has to argue for itself in
+ * review rather than pass silently on whichever host happens to resolve `node`.
+ */
+const EXEMPTION_MARKER = "allow-env-shebang:";
+/** How far above a match the marker may sit — enough for a short comment block. */
+const MARKER_WINDOW = 6;
+
+describe("the env-node shebang stays gone from test fixtures", () => {
+  it("has no unjustified `#!/usr/bin/env node` left in any test file", async () => {
+    let repoRoot: string;
+    try {
+      const { stdout } = await run("git", ["rev-parse", "--show-toplevel"]);
+      repoRoot = stdout.trim();
+    } catch {
+      return; // Packaged copies have no git checkout to scan; nothing to guard.
+    }
+
+    let matches: string[] = [];
+    try {
+      const { stdout } = await run(
+        "git",
+        ["grep", "-n", "--", "#!/usr/bin/env node", "--", "*.test.ts", "*.test.tsx", "*.test.mjs", "*.test.js"],
+        { cwd: repoRoot },
+      );
+      matches = stdout.split("\n").filter(Boolean);
+    } catch {
+      return; // `git grep` exits 1 with no matches, which is the passing case.
+    }
+
+    const sources = new Map<string, string[]>();
+    const offenders: string[] = [];
+    for (const match of matches) {
+      const [file, lineNumber] = match.split(":");
+      if (!file || !lineNumber) continue;
+      // This suite is the helper's own documentation of the pattern it replaces.
+      if (file === "packages/shared/src/testing/node-script-fixture.test.ts") continue;
+      let lines = sources.get(file);
+      if (!lines) {
+        lines = (await fs.readFile(path.join(repoRoot, file), "utf8")).split("\n");
+        sources.set(file, lines);
+      }
+      const index = Number(lineNumber) - 1;
+      const window = lines.slice(Math.max(0, index - MARKER_WINDOW), index + 1).join("\n");
+      if (!window.includes(EXEMPTION_MARKER)) offenders.push(match);
+    }
+
+    expect(offenders).toEqual([]);
+  });
+});

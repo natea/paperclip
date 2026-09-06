@@ -26,6 +26,7 @@ import {
   OpenCodeServerDriver,
   openCodeServerDriverInternals,
 } from "./opencode-server-driver.js";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 const roots: string[] = [];
 const fixture = resolve("test/fixtures/fake-opencode-server.mjs");
@@ -1784,10 +1785,9 @@ describe("OpenCodeServerDriver", () => {
     );
     roots.push(root, workspace);
     const exitingFixture = join(root, "exit-before-health.mjs");
-    await writeFile(
+    await writeExecutableNodeFixture(
       exitingFixture,
-      "#!/usr/bin/env node\nprocess.stderr.write(`credential=${process.env.OPENROUTER_API_KEY}\\nauthorization=super-secret-opencode-token\\n`);\nprocess.exit(17);\n",
-      { mode: 0o755 },
+      "process.stderr.write(`credential=${process.env.OPENROUTER_API_KEY}\\nauthorization=super-secret-opencode-token\\n`);\nprocess.exit(17);\n",
     );
     const driver = new OpenCodeServerDriver({
       model: "openrouter/deepseek/deepseek-v4-flash-0731",
