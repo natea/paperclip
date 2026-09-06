@@ -1027,6 +1027,57 @@ describe("issue execution policy routes", () => {
     expect(mockHeartbeatService.cancelRun).not.toHaveBeenCalled();
   });
 
+  // AND-57 invariant: a 2xx from PATCH /api/issues/{id} means every field in
+  // the request body was applied. A workflow repair may add fields, but it may
+  // never silently replace one the caller sent — a refusal has to surface as a
+  // non-2xx (the escalated-hold and stage-advance branches already throw 422).
+  it("applies the caller's explicit status when a stranded review is dissolved in the same PATCH", async () => {
+    const issue = {
+      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      companyId: "company-1",
+      status: "in_review",
+      reviewPolicy: null,
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeUserId: null,
+      createdByUserId: "local-board",
+      identifier: "PAP-1057",
+      title: "Stranded review with an explicit terminal status",
+      // Every participant of the only stage has been removed, so the stored
+      // policy normalizes to null while the pending execution state survives.
+      executionPolicy: { stages: [] },
+      executionState: {
+        status: "pending",
+        currentStageId: "11111111-1111-4111-8111-111111111111",
+        currentStageIndex: 0,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+        returnAssignee: { type: "agent", agentId: "44444444-4444-4444-8444-444444444444" },
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(await createApp())
+      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+      .send({ status: "done" });
+
+    expect(res.status).toBe(200);
+    const updatePatch = mockIssueService.update.mock.calls[0]?.[1] as Record<string, unknown>;
+    // The repair still runs...
+    expect(updatePatch.executionState).toBeNull();
+    // ...but the caller's status is what persists, and what the 200 reports.
+    expect(updatePatch.status).toBe("done");
+    expect(updatePatch.assigneeAgentId).toBeUndefined();
+    expect(res.body.status).toBe("done");
+  });
+
   it("does not auto-start execution review when reviewers are added to an already in_review issue", async () => {
     const policy = normalizeIssueExecutionPolicy({
       stages: [

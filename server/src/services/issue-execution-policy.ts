@@ -676,11 +676,17 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
 
   if (!input.policy) {
     if (existingState) {
-      patch.executionState = null;
-      if (input.issue.status === "in_review" && existingState.returnAssignee) {
-        patch.status = "in_progress";
-        Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
-      }
+      // Dissolving a review whose policy is gone is a repair, not a verdict:
+      // it must not outrank a status the caller explicitly asked for in the
+      // same request, or the PATCH returns 2xx having silently dropped the
+      // caller's status. Share clearExecutionStatePatch with the sibling
+      // "stage no longer exists" branch so the two cannot drift apart again.
+      clearExecutionStatePatch({
+        patch,
+        issueStatus: input.issue.status,
+        requestedStatus,
+        returnAssignee: existingState.returnAssignee,
+      });
     }
     return { patch };
   }
