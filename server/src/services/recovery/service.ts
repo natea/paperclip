@@ -39,6 +39,7 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { hasPendingWakeInteraction as hasPendingWakeInteractionFor } from "./pending-wake-interaction.js";
 import { TERMINAL_HEARTBEAT_RUN_STATUSES, issueService } from "../issues.js";
+import type { IssueLivenessFinding } from "../issue-liveness.js";
 import {
   applyIssueMonitorPolicyTransition,
   normalizeIssueExecutionPolicy,
@@ -88,6 +89,49 @@ const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiv
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON = "execution_review_participant_recovery";
 const STRANDED_BOARD_ESCALATION_POLICY = "board_escalation_no_takeover_v1";
+
+/**
+ * Ceiling on recovery issues opened per company per tick. A graph that has gone badly wrong
+ * can produce dozens of critical findings at once; opening all of them in one tick would bury
+ * the board under exactly the noise this escalation exists to prevent. The remainder is not
+ * lost -- the findings are level-triggered, so the next tick picks up where this one stopped.
+ */
+const ISSUE_GRAPH_LIVENESS_ESCALATION_PER_COMPANY_LIMIT = 10;
+
+function issueGraphLivenessIssueLink(identifier: string | null, fallback: string) {
+  if (!identifier || !/^[A-Z][A-Z0-9]*-\d+$/.test(identifier)) return identifier ?? fallback;
+  return `[${identifier}](/${identifier.split("-")[0]}/issues/${identifier})`;
+}
+
+function buildIssueGraphLivenessEscalationDescription(finding: IssueLivenessFinding) {
+  const sourceLink = issueGraphLivenessIssueLink(finding.identifier, finding.issueId);
+  const path = finding.dependencyPath
+    .map((entry) => `- ${issueGraphLivenessIssueLink(entry.identifier, entry.issueId)} (${entry.status}) — ${entry.title}`)
+    .join("\n");
+  return [
+    `## Stranded issue: ${sourceLink}`,
+    "",
+    "Paperclip's issue-graph liveness classifier found this issue has no path that will ever",
+    "wake an agent, and raised it at `critical` severity. This recovery issue exists so the",
+    "finding schedules work instead of only appearing in the blocked inbox.",
+    "",
+    `- Finding: \`${finding.state}\``,
+    `- Reason: ${finding.reason}`,
+    "",
+    "### Dependency path",
+    "",
+    path || `- ${sourceLink}`,
+    "",
+    "### Next action",
+    "",
+    finding.recommendedAction,
+    "",
+    "Close this issue once the source issue has a real path again (an assignee that will wake,",
+    "a reviewer, an interaction, a monitor, or a deliberate `done`/`cancelled`). If the finding",
+    "is a false positive, say why in a comment and close this issue — the classifier is",
+    "level-triggered and will re-raise it if the shape is still there.",
+  ].join("\n");
+}
 const DISPOSITION_REPAIR_IDEMPOTENCY_INDEX = "agent_wakeup_requests_disposition_repair_idempotency_uq";
 const RESOLVED_DEPENDENCY_WAKE_BACKSTOP_CANDIDATE_LIMIT = 500;
 const SESSIONED_LOCAL_ADAPTERS = new Set([
@@ -689,6 +733,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   const treeControlSvc = issueTreeControlService(db);
   const budgets = budgetService(db);
   let resolvedDependencyWakeBackstopCandidateCursor: string | null = null;
+  let lastIssueGraphLivenessEscalationSweepAtMs: number | null = null;
 
   async function getAgent(agentId: string) {
     return db.select().from(agents).where(eq(agents.id, agentId)).then((rows) => rows[0] ?? null);
@@ -4488,6 +4533,251 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return result;
   }
 
+
+  /**
+   * AND-56: act on `critical` issue-graph liveness findings instead of only rendering them.
+   *
+   * Three tranches (the classifier, AND-51, AND-53) made detection good, but a finding only
+   * ever reached `listIssueBlockedInboxAttentionMap` -- a dashboard row. Clearing it required
+   * a human to open the blocked inbox. AND-52 sat `in_review` with a correct
+   * `in_review_without_action_path` finding for 51 minutes and was cleared only by accident.
+   *
+   * Mechanism: file a recovery issue assigned to the finding's recommended owner. Chosen over
+   * a direct assignee wake or a scheduled monitor because
+   *   - the read side for `harness_liveness_escalation` was already fully built and unused:
+   *     the incident key parses back to (source, leaf), the blocked inbox renders it as
+   *     `recovery_open`, and closing it cleans up its own blocks relation;
+   *   - it is durable. A queued wake can be dropped by a restart or throttled away
+   *     (`issue_graph_liveness_backstop` is in THROTTLED_ISSUE_REWAKE_REASONS); an issue row
+   *     survives, so the loop cannot silently reopen;
+   *   - idempotency is level-triggered rather than bookkept. `classifyIssueGraphLiveness`
+   *     already consumes `openRecoveryIssues` as a waiting path keyed on both the source and
+   *     leaf issue, so the finding stops being produced the moment the recovery issue exists.
+   *     Ten scheduler ticks over a persistent strand therefore produce one recovery issue.
+   *     The explicit originId lookup below is the belt to that suspenders, and covers the
+   *     window before the escalation is visible to the next snapshot.
+   *
+   * `warning` findings (an ordinary cold backlog item) stay dashboard-only on purpose.
+   */
+  async function reconcileIssueGraphLivenessEscalations(opts?: {
+    companyId?: string | null;
+    runId?: string | null;
+    /**
+     * Floor between sweeps. Classifying the full issue graph is not free, and the scheduler
+     * ticks every 30s; a strand that has already outlived a detector tranche does not need
+     * sub-minute latency. The periodic caller passes a few minutes, callers that want an
+     * immediate sweep (startup, tests) pass nothing.
+     */
+    minIntervalMs?: number;
+  }) {
+    const result = {
+      throttled: false,
+      companiesScanned: 0,
+      findings: 0,
+      criticalFindings: 0,
+      created: 0,
+      existingSkipped: 0,
+      ownerlessSkipped: 0,
+      pauseHoldSkipped: 0,
+      creationCapped: 0,
+      wakeQueued: 0,
+      failed: 0,
+      issueIds: [] as string[],
+      recoveryIssueIds: [] as string[],
+    };
+
+    const nowMs = Date.now();
+    const minIntervalMs = opts?.minIntervalMs ?? 0;
+    if (
+      minIntervalMs > 0 &&
+      lastIssueGraphLivenessEscalationSweepAtMs !== null &&
+      nowMs - lastIssueGraphLivenessEscalationSweepAtMs < minIntervalMs
+    ) {
+      result.throttled = true;
+      return result;
+    }
+    lastIssueGraphLivenessEscalationSweepAtMs = nowMs;
+
+    const companyRows = opts?.companyId
+      ? [{ id: opts.companyId }]
+      // A paused company is deliberately stopped. Opening recovery work there would fight the
+      // pause for exactly the reason the per-issue pause-hold guard below exists.
+      : await db.select({ id: companies.id }).from(companies).where(eq(companies.status, "active"));
+    result.companiesScanned = companyRows.length;
+
+    for (const company of companyRows) {
+      let findings: IssueLivenessFinding[];
+      try {
+        findings = await issuesSvc.listIssueGraphLivenessFindings(company.id);
+      } catch (err) {
+        result.failed += 1;
+        logger.warn({ err, companyId: company.id }, "issue graph liveness escalation failed to classify company");
+        continue;
+      }
+      result.findings += findings.length;
+
+      const critical = findings.filter((finding) => finding.severity === "critical");
+      result.criticalFindings += critical.length;
+
+      let createdForCompany = 0;
+      for (const finding of critical) {
+        if (createdForCompany >= ISSUE_GRAPH_LIVENESS_ESCALATION_PER_COMPANY_LIMIT) {
+          result.creationCapped += 1;
+          continue;
+        }
+
+        // Guard the failure mode the issue calls out: a recovery action that itself has no
+        // wake path. `recommendedOwnerAgentId` is already filtered to an invokable in-company
+        // agent by the classifier's owner-candidate walk, so a null here means there is no
+        // agent that could own it and creating an unassigned issue would just add another
+        // stranded row.
+        const ownerAgentId = finding.recommendedOwnerAgentId;
+        if (!ownerAgentId) {
+          result.ownerlessSkipped += 1;
+          continue;
+        }
+
+        const existing = await db
+          .select({ id: issues.id })
+          .from(issues)
+          .where(
+            and(
+              eq(issues.companyId, company.id),
+              eq(issues.originKind, RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation),
+              eq(issues.originId, finding.incidentKey),
+              visibleIssueCondition(),
+              notInArray(issues.status, ["done", "cancelled"]),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) {
+          result.existingSkipped += 1;
+          continue;
+        }
+
+        if (await isAutomaticRecoverySuppressedByPauseHold(db, company.id, finding.issueId, treeControlSvc)) {
+          result.pauseHoldSkipped += 1;
+          continue;
+        }
+
+        const sourceIssue = await db
+          .select({
+            id: issues.id,
+            companyId: issues.companyId,
+            identifier: issues.identifier,
+            title: issues.title,
+            projectId: issues.projectId,
+            goalId: issues.goalId,
+            billingCode: issues.billingCode,
+          })
+          .from(issues)
+          .where(and(eq(issues.companyId, company.id), eq(issues.id, finding.issueId)))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (!sourceIssue) {
+          result.failed += 1;
+          continue;
+        }
+
+        try {
+          const recoveryIssue = await issuesSvc.create(company.id, {
+            title: `Restore a live path for ${finding.identifier ?? sourceIssue.title}`,
+            description: buildIssueGraphLivenessEscalationDescription(finding),
+            // `todo` with an agent assignee and no user assignee is exactly the shape the
+            // classifier treats as eligible, so this recovery issue cannot itself become the
+            // next stranded finding.
+            status: "todo",
+            priority: "high",
+            projectId: sourceIssue.projectId,
+            goalId: sourceIssue.goalId,
+            assigneeAgentId: ownerAgentId,
+            assigneeUserId: null,
+            originKind: RECOVERY_ORIGIN_KINDS.issueGraphLivenessEscalation,
+            originId: finding.incidentKey,
+            originFingerprint: `issue_graph_liveness:${finding.state}`,
+            billingCode: sourceIssue.billingCode,
+          });
+
+          createdForCompany += 1;
+          result.created += 1;
+          result.issueIds.push(finding.issueId);
+          result.recoveryIssueIds.push(recoveryIssue.id);
+
+          await logActivity(db, {
+            companyId: company.id,
+            actorType: "system",
+            actorId: "issue_graph_liveness_escalation",
+            agentId: ownerAgentId,
+            runId: opts?.runId ?? null,
+            action: "issue.liveness_escalation_issue_created",
+            entityType: "issue",
+            entityId: finding.issueId,
+            details: {
+              state: finding.state,
+              severity: finding.severity,
+              incidentKey: finding.incidentKey,
+              recoveryIssueId: recoveryIssue.id,
+              recoveryIdentifier: recoveryIssue.identifier,
+              leafIssueId: finding.recoveryIssueId,
+              ownerAgentId,
+              ownerReason: finding.recommendedOwnerCandidates[0]?.reason ?? null,
+            },
+          });
+
+          const wake = await deps.enqueueWakeup(ownerAgentId, {
+            source: "automation",
+            triggerDetail: "system",
+            reason: "issue_liveness_escalation",
+            idempotencyKey: `issue-graph-liveness-escalation:${finding.incidentKey}`,
+            payload: withRecoveryContext(
+              { issueId: recoveryIssue.id, sourceIssueId: finding.issueId },
+              "normal_model",
+            ),
+            requestedByActorType: "system",
+            requestedByActorId: "issue_graph_liveness_escalation",
+            contextSnapshot: withRecoveryContext(
+              {
+                issueId: recoveryIssue.id,
+                taskId: recoveryIssue.id,
+                sourceIssueId: finding.issueId,
+                wakeReason: "issue_liveness_escalation",
+                source: "issue.graph_liveness_escalation",
+              },
+              "normal_model",
+            ),
+          });
+          // A null wake is a deferred/gated enqueue, not a failure: the recovery issue is
+          // assigned and non-terminal, so ordinary assignment dispatch still reaches it.
+          if (wake) result.wakeQueued += 1;
+        } catch (err) {
+          result.failed += 1;
+          logger.warn(
+            { err, companyId: company.id, issueId: finding.issueId, incidentKey: finding.incidentKey },
+            "failed to create issue graph liveness escalation issue",
+          );
+        }
+      }
+
+      if (result.creationCapped > 0) {
+        logger.warn(
+          {
+            companyId: company.id,
+            created: createdForCompany,
+            limit: ISSUE_GRAPH_LIVENESS_ESCALATION_PER_COMPANY_LIMIT,
+          },
+          "issue graph liveness escalation hit its per-company creation cap",
+        );
+      }
+    }
+
+    if (result.created > 0) {
+      logger.warn({ ...result }, "issue graph liveness escalation opened recovery issues for critical findings");
+    }
+
+    return result;
+  }
+
   function readRecoveryTimerIntervalMs(raw: unknown, fallback: number) {
     return Math.max(1, Math.floor(asNumber(raw, fallback)));
   }
@@ -4891,6 +5181,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     reconcileStrandedAssignedIssues,
     sweepStaleIssueLocks,
     reconcileResolvedDependencyWakeBackstop,
+    reconcileIssueGraphLivenessEscalations,
     readRecoveryTimerIntervalMs,
   };
 }

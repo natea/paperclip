@@ -1073,6 +1073,10 @@ export async function startServer(): Promise<StartedServer> {
       await Promise.allSettled([...heartbeatSchedulerInFlight]);
     }
   };
+  // The scheduler ticks every 30s. A stranded issue that already survived the detector does
+  // not need sub-minute escalation latency, and classifying the whole issue graph per company
+  // is the expensive half of this reconciler.
+  const ISSUE_GRAPH_LIVENESS_ESCALATION_MIN_INTERVAL_MS = 5 * 60 * 1000;
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
     heartbeatSchedulerInterval = setInterval(callback, config.heartbeatSchedulerIntervalMs);
     heartbeatSchedulerInterval?.unref?.();
@@ -1368,6 +1372,14 @@ export async function startServer(): Promise<StartedServer> {
           );
         }
 
+        const livenessEscalated = await heartbeat.reconcileIssueGraphLivenessEscalations();
+        if (livenessEscalated.created > 0 || livenessEscalated.failed > 0) {
+          logger.warn(
+            { ...livenessEscalated },
+            "startup issue-graph liveness escalation opened recovery work for critical findings",
+          );
+        }
+
         const scanned = await heartbeat.scanSilentActiveRuns();
         if (scanned.created > 0 || scanned.escalated > 0) {
           logger.warn({ ...scanned }, "startup active-run output watchdog created review work");
@@ -1601,6 +1613,17 @@ export async function startServer(): Promise<StartedServer> {
               const reconciled = await heartbeat.reconcileTaskWatchdogs();
               if (reconciled.triggered > 0) {
                 logger.warn({ ...reconciled }, "periodic task-watchdog reconciliation triggered watchdog work");
+              }
+            })
+            .then(async () => {
+              const escalated = await heartbeat.reconcileIssueGraphLivenessEscalations({
+                minIntervalMs: ISSUE_GRAPH_LIVENESS_ESCALATION_MIN_INTERVAL_MS,
+              });
+              if (escalated.created > 0 || escalated.failed > 0) {
+                logger.warn(
+                  { ...escalated },
+                  "periodic issue-graph liveness escalation opened recovery work for critical findings",
+                );
               }
             })
             .then(async () => {

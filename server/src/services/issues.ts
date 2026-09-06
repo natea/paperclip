@@ -3810,15 +3810,36 @@ function compareBlockedInboxRows(
   return right.id.localeCompare(left.id);
 }
 
-async function listIssueBlockedInboxAttentionMap(
+interface IssueGraphLivenessSnapshotRow {
+  companyId: string;
+  issueId: string | null;
+  agentId: string | null;
+  status: string;
+}
+
+export interface IssueGraphLivenessSnapshot {
+  graphIssues: IssueRow[];
+  issuesById: Map<string, IssueRow>;
+  findings: IssueLivenessFinding[];
+  activeRunRows: IssueGraphLivenessSnapshotRow[];
+  wakeRows: IssueGraphLivenessSnapshotRow[];
+  scheduledRetryRows: IssueGraphLivenessSnapshotRow[];
+  interactionRows: BlockedInboxInteractionRow[];
+  approvalRows: BlockedInboxApprovalRow[];
+}
+
+/**
+ * Build the company-wide input for `classifyIssueGraphLiveness` and run it.
+ *
+ * Extracted from `listIssueBlockedInboxAttentionMap` so the dashboard read path and the
+ * recovery reconciler that acts on `critical` findings (AND-56) classify from exactly the
+ * same graph. If they diverged, the escalation would fire on findings the board never sees
+ * -- or, worse, stay silent on the ones it does.
+ */
+async function computeIssueGraphLivenessSnapshot(
   dbOrTx: any,
   companyId: string,
-  issueRows: BlockedInboxIssueRow[],
-): Promise<Map<string, IssueBlockedInboxAttention>> {
-  const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
-  const result = new Map<string, IssueBlockedInboxAttention>();
-  if (rowIssueIds.length === 0) return result;
-
+): Promise<IssueGraphLivenessSnapshot> {
   const [graphIssueRows, graphRelationRows, companyAgentRows] = await Promise.all([
     dbOrTx
       .select()
@@ -3864,7 +3885,7 @@ async function listIssueBlockedInboxAttentionMap(
   const graphIssueIds = graphIssues.map((issue) => issue.id);
   const issuesById = new Map<string, IssueRow>(graphIssues.map((issue) => [issue.id, issue]));
 
-  const [activeRunRows, wakeRows, scheduledRetryRows, interactionRows, approvalRows, handoffMap] = await Promise.all([
+  const [activeRunRows, wakeRows, scheduledRetryRows, interactionRows, approvalRows] = await Promise.all([
     graphIssueIds.length === 0
       ? Promise.resolve([])
       : dbOrTx
@@ -3963,7 +3984,6 @@ async function listIssueBlockedInboxAttentionMap(
             inArray(approvals.status, [...BLOCKED_INBOX_PENDING_APPROVAL_STATUSES]),
             inArray(issueApprovals.issueId, graphIssueIds),
           )),
-    listSuccessfulRunHandoffMapForIssues(dbOrTx, companyId, rowIssueIds, { hydrateLiveness: false }),
   ]);
 
   const pendingInteractions = (interactionRows as BlockedInboxInteractionRow[]).map((row) => ({
@@ -3994,6 +4014,23 @@ async function listIssueBlockedInboxAttentionMap(
       return entries;
     });
 
+  // graphIssues excludes `done`, so a closed parent is invisible there. The unassigned-wake-path
+  // finding weights a stranded child by whether its parent already closed, so resolve those.
+  const missingParentIds = [...new Set(
+    graphIssues
+      .map((issue) => issue.parentId)
+      .filter((parentId): parentId is string => Boolean(parentId) && !issuesById.has(parentId!)),
+  )];
+  const closedParentStatusById = new Map<string, string>(
+    missingParentIds.length === 0
+      ? []
+      : ((await dbOrTx
+          .select({ id: issues.id, status: issues.status })
+          .from(issues)
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, missingParentIds)))) as Array<{ id: string; status: string }>)
+          .map((row) => [row.id, row.status] as const),
+  );
+
   const findings = classifyIssueGraphLiveness({
     issues: graphIssues.map((issue) => ({
       id: issue.id,
@@ -4004,6 +4041,7 @@ async function listIssueBlockedInboxAttentionMap(
       projectId: issue.projectId,
       goalId: issue.goalId,
       parentId: issue.parentId,
+      parentStatus: issue.parentId ? closedParentStatusById.get(issue.parentId) ?? null : null,
       assigneeAgentId: issue.assigneeAgentId,
       assigneeUserId: issue.assigneeUserId,
       createdByAgentId: issue.createdByAgentId,
@@ -4031,6 +4069,42 @@ async function listIssueBlockedInboxAttentionMap(
     openRecoveryIssues,
     now: new Date(),
   });
+
+  return {
+    graphIssues,
+    issuesById,
+    findings,
+    activeRunRows: activeRunRows as IssueGraphLivenessSnapshotRow[],
+    wakeRows: wakeRows as IssueGraphLivenessSnapshotRow[],
+    scheduledRetryRows: scheduledRetryRows as IssueGraphLivenessSnapshotRow[],
+    interactionRows: interactionRows as BlockedInboxInteractionRow[],
+    approvalRows: approvalRows as BlockedInboxApprovalRow[],
+  };
+}
+
+
+async function listIssueBlockedInboxAttentionMap(
+  dbOrTx: any,
+  companyId: string,
+  issueRows: BlockedInboxIssueRow[],
+): Promise<Map<string, IssueBlockedInboxAttention>> {
+  const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
+  const result = new Map<string, IssueBlockedInboxAttention>();
+  if (rowIssueIds.length === 0) return result;
+
+  const [snapshot, handoffMap] = await Promise.all([
+    computeIssueGraphLivenessSnapshot(dbOrTx, companyId),
+    listSuccessfulRunHandoffMapForIssues(dbOrTx, companyId, rowIssueIds, { hydrateLiveness: false }),
+  ]);
+  const {
+    issuesById,
+    findings,
+    activeRunRows,
+    wakeRows,
+    scheduledRetryRows,
+    interactionRows,
+    approvalRows,
+  } = snapshot;
   const findingByIssueId = new Map<string, IssueLivenessFinding>();
   for (const finding of findings) {
     if (!findingByIssueId.has(finding.issueId)) findingByIssueId.set(finding.issueId, finding);
@@ -4162,6 +4236,7 @@ async function listIssueBlockedInboxAttentionMap(
         ? issuesById.get(finding.dependencyPath[finding.dependencyPath.length - 1]!.issueId)
         : issuesById.get(finding.recoveryIssueId);
       const ownerAgentId = finding.state === "blocked_by_unassigned_issue"
+        || finding.state === "unassigned_without_wake_path"
         ? null
         : finding.recommendedOwnerAgentId ?? row.assigneeAgentId ?? leaf?.assigneeAgentId ?? null;
       result.set(row.id, attentionBase({
@@ -4170,6 +4245,10 @@ async function listIssueBlockedInboxAttentionMap(
         severity: finding.state === "blocked_by_assigned_backlog_issue"
           || finding.state === "in_review_without_action_path"
           ? "high"
+          // A cold unassigned backlog item is real but routine; only a child stranded under a
+          // closed parent (severity critical) is worth crowding the top of the inbox.
+          : finding.state === "unassigned_without_wake_path"
+          ? (finding.severity === "critical" ? "high" : "medium")
           : finding.severity === "critical" ? "critical" : "high",
         stoppedSinceAt: leaf?.updatedAt ?? row.updatedAt,
         owner: {
@@ -4193,6 +4272,8 @@ async function listIssueBlockedInboxAttentionMap(
                 return "Repair review participant";
               case "in_review_without_action_path":
                 return "Choose review path";
+              case "unassigned_without_wake_path":
+                return "Assign owner";
             }
           })(),
           detail: finding.recommendedAction,
@@ -6715,6 +6796,19 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
     ) => {
       return listIssueReviewAttentionMap(dbOrTx, companyId, issueRows);
+    },
+
+    /**
+     * Raw issue-graph liveness findings for a company, from the same snapshot the blocked
+     * inbox renders. The recovery reconciler consumes this to act on `critical` findings
+     * instead of leaving them as dashboard rows (AND-56).
+     */
+    listIssueGraphLivenessFindings: async (
+      companyId: string,
+      dbOrTx: any = db,
+    ): Promise<IssueLivenessFinding[]> => {
+      const snapshot = await computeIssueGraphLivenessSnapshot(dbOrTx, companyId);
+      return snapshot.findings;
     },
 
     listProductivityReviews: async (

@@ -17379,6 +17379,14 @@ export function heartbeatService(
     return recovery.reconcileResolvedDependencyWakeBackstop(opts);
   }
 
+  async function reconcileIssueGraphLivenessEscalations(opts?: {
+    runId?: string | null;
+    companyId?: string | null;
+    minIntervalMs?: number;
+  }) {
+    return recovery.reconcileIssueGraphLivenessEscalations(opts);
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -25920,6 +25928,7 @@ export function heartbeatService(
     sweepStaleIssueLocks,
 
     reconcileResolvedDependencyWakes,
+    reconcileIssueGraphLivenessEscalations,
 
     scanSilentActiveRuns,
 
