@@ -10,6 +10,7 @@ import {
   readWorktreeSeedManifest,
 } from "../../../cli/src/commands/worktree.ts";
 import { realizeExecutionWorkspace } from "../services/workspace-runtime.ts";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 const execFileAsync = promisify(execFile);
 const cleanup: string[] = [];
@@ -91,7 +92,13 @@ afterEach(async () => {
 
 describe("managed worktree seed source through the server spawn path", () => {
   it("re-derives an ambient-instance manifest written before provisioning", async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-server-seed-source-"));
+    // `os.tmpdir()` is a symlink alias on macOS (`/var/folders/...` ->
+    // `/private/var/folders/...`), and `resolveRegisteredWorktreeSeedSource`
+    // rejects a non-canonical registered workspace by design. Canonicalize here
+    // so the suite tests seed re-derivation rather than the host's TMPDIR shape.
+    const tempRoot = await fs.realpath(
+      await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-server-seed-source-")),
+    );
     cleanup.push(tempRoot);
     const repoRoot = path.join(tempRoot, "repo");
     const hooksDir = path.join(tempRoot, "hooks");
@@ -121,10 +128,7 @@ describe("managed worktree seed source through the server spawn path", () => {
     // target config whose manifest diagnostic points at the ambient instance.
     await fs.mkdir(hooksDir, { recursive: true });
     const hookPath = path.join(hooksDir, "post-checkout");
-    await fs.writeFile(
-      hookPath,
-      `#!/usr/bin/env node
-const crypto = require("node:crypto");
+    await writeExecutableNodeFixture(hookPath, `const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const cwd = process.cwd();
@@ -174,10 +178,7 @@ fs.writeFileSync(path.join(stateDir, "seed-manifest.json"), JSON.stringify({
   finishedAt: null,
   diagnostics: [{ phase: "pending", status: "succeeded", at: new Date().toISOString() }],
 }, null, 2) + "\\n");
-`,
-      "utf8",
-    );
-    await fs.chmod(hookPath, 0o755);
+`);
     await runGit(repoRoot, ["config", "core.hooksPath", hooksDir]);
 
     process.env.PAPERCLIP_CONFIG = ambientConfigPath;

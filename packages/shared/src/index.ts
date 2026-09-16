@@ -1746,7 +1746,12 @@ export {
   SMOKE_RUN_TRIGGERS,
 } from "./types/smoke-lab.js";
 
-export type { ServerGitInfo, ServerGitLocalChanges, ServerInfoSnapshot } from "./types/server-info.js";
+export type {
+  ServerGitInfo,
+  ServerGitLocalChanges,
+  ServerInfoSnapshot,
+  ServerRuntimeFreshness,
+} from "./types/server-info.js";
 
 export {
   getClosedIsolatedExecutionWorkspaceMessage,

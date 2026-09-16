@@ -96,7 +96,8 @@ function registerRouteMocks() {
     instanceSettingsService: () => mockInstanceSettingsService,
   }));
 
-  vi.doMock("../services/issues.js", () => ({
+  vi.doMock("../services/issues.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../services/issues.js")>()),
     issueService: () => mockIssueService,
   }));
 

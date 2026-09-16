@@ -48,6 +48,7 @@ import {
   type RunnerProcessLaunchSpec,
 } from "../../vendor/paperclip-runner/index.js";
 import type { AdapterExecutionTarget } from "@paperclipai/adapter-utils/execution-target";
+import type { RunProcessSpawnMeta } from "@paperclipai/adapter-utils";
 import { createSshCommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/ssh";
 import type { CommandManagedRuntimeRunner } from "@paperclipai/adapter-utils/command-managed-runtime";
 import {
@@ -3154,11 +3155,7 @@ export async function executePaperclipNativeSession(input: {
   execution: NativeExecutionInput;
   runnerInstanceId: string;
   leaseOwner?: string;
-  onSpawn?: (meta: {
-    pid: number;
-    processGroupId: number | null;
-    startedAt: string;
-  }) => Promise<void>;
+  onSpawn?: (meta: RunProcessSpawnMeta) => Promise<void>;
   /** Test seam at the provider boundary; production uses a qualified package backend. */
   backend?: NativeSessionBackend;
   useRunnerd?: boolean;
@@ -5066,11 +5063,7 @@ function createRemoteRunnerProcessLauncher(input: {
   remoteBinary: string;
   runnerInstanceId: string;
   ensureArtifact?: () => Promise<void>;
-  onSpawn?: (meta: {
-    pid: number;
-    processGroupId: number | null;
-    startedAt: string;
-  }) => Promise<void>;
+  onSpawn?: (meta: RunProcessSpawnMeta) => Promise<void>;
   onLog?: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   trace?: NativeRunTrace;
   onRunnerProcessSpawned?: () => void;
@@ -5182,11 +5175,7 @@ export async function createRunnerdBackend(input: {
   execution: NativeExecutionInput;
   runnerInstanceId: string;
   durableEnvironmentLeaseId?: string;
-  onSpawn?: (meta: {
-    pid: number;
-    processGroupId: number | null;
-    startedAt: string;
-  }) => Promise<void>;
+  onSpawn?: (meta: RunProcessSpawnMeta) => Promise<void>;
   runnerEnvironment?: NodeJS.ProcessEnv;
   runnerExecutionTarget?: AdapterExecutionTarget | null;
   /** Resolved per-run authorization; not an independent instance setting. */

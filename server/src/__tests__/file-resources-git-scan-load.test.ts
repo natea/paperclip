@@ -102,6 +102,13 @@ describe("workspace Git scan route load regression", () => {
     let active = 0;
     let peakActive = 0;
     let runnerCalls = 0;
+    // Every request that has actually reached the service. The single-flight
+    // total is derived from this rather than hard-coded, so a request still in
+    // flight shows up as "arrivals stuck at N" instead of an inscrutable
+    // off-by-one on a magic 498.
+    let arrivals = 0;
+    const REQUEST_COUNT = 500;
+    const CONCURRENCY = 2;
     const runner: WorkspaceGitRunner = async () => {
       runnerCalls += 1;
       active += 1;
@@ -111,7 +118,7 @@ describe("workspace Git scan route load regression", () => {
       return { stdout: "", stderr: "" };
     };
     const scheduler = createWorkspaceGitOperationScheduler({
-      concurrency: 2,
+      concurrency: CONCURRENCY,
       queueCapacity: 4,
       runner,
       defaultCacheTtlMs: 0,
@@ -120,6 +127,7 @@ describe("workspace Git scan route load regression", () => {
     const service: WorkspaceFileResourceService = {
       getIssue: vi.fn(async () => ({ companyId })),
       list: vi.fn(async (issueId, input, opts) => {
+        arrivals += 1;
         const numericId = Number(issueId.slice("issue-".length));
         await scheduler.run({
           workspacePath: roots[numericId % roots.length]!,
@@ -134,18 +142,31 @@ describe("workspace Git scan route load regression", () => {
       ...unavailableMethods(),
     };
     const app = createLoadApp(db, companyId, service);
-    const pendingResponses = Array.from({ length: 500 }, (_, index) => request(app)
+    const pendingResponses = Array.from({ length: REQUEST_COUNT }, (_, index) => request(app)
       .get(`/api/issues/issue-${index}/file-resources/list`)
       .set("x-test-actor", `actor-${index % 73}`)
       .query({ mode: "changed" })
       .then((response) => response));
 
+    // Barrier: every request has reached the service. Waiting on the arrival
+    // count states the precondition directly; waiting on a derived total left
+    // the test asserting an exact number that silently encodes "and no socket
+    // was dropped along the way".
     await vi.waitFor(
-      () => expect(scheduler.snapshot().totals.singleFlightJoins).toBe(498),
+      () => expect(arrivals).toBe(REQUEST_COUNT),
+      { timeout: 15_000, interval: 20 },
+    );
+    // The bound itself: two scans run, every other request joins one of them.
+    await vi.waitFor(
+      () => expect(scheduler.snapshot().totals.singleFlightJoins).toBe(REQUEST_COUNT - CONCURRENCY),
       { timeout: 15_000, interval: 20 },
     );
     const loadedSnapshot = scheduler.snapshot();
-    expect(loadedSnapshot).toMatchObject({ activeCount: 2, queuedCount: 0, inFlightCount: 2 });
+    expect(loadedSnapshot).toMatchObject({
+      activeCount: CONCURRENCY,
+      queuedCount: 0,
+      inFlightCount: CONCURRENCY,
+    });
 
     const healthLatencies: number[] = [];
     for (let index = 0; index < 25; index += 1) {
@@ -164,8 +185,8 @@ describe("workspace Git scan route load regression", () => {
       counts[response.status] = (counts[response.status] ?? 0) + 1;
       return counts;
     }, {});
-    expect(outcomeCounts).toEqual({ 200: 500 });
-    expect({ runnerCalls, peakActive }).toEqual({ runnerCalls: 2, peakActive: 2 });
+    expect(outcomeCounts).toEqual({ 200: REQUEST_COUNT });
+    expect({ runnerCalls, peakActive }).toEqual({ runnerCalls: CONCURRENCY, peakActive: CONCURRENCY });
     expect(scheduler.snapshot()).toMatchObject({ activeCount: 0, queuedCount: 0, inFlightCount: 0 });
 
     console.info("workspace Git scan regression metrics", {

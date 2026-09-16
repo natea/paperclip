@@ -45,6 +45,34 @@ describeEmbeddedPostgres("agent service clearError", () => {
     await tempDb?.cleanup();
   });
 
+  async function seedAgent(input: { status: string; errorReason?: string | null }) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: input.status,
+      errorReason: input.errorReason ?? null,
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    return { companyId, agentId };
+  }
+
   it("moves an error agent to idle without deleting run history or runtime diagnostics", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
@@ -158,34 +186,34 @@ describeEmbeddedPostgres("agent service clearError", () => {
     });
   });
 
-  it("rejects non-error agents with a 409 conflict", async () => {
-    const companyId = randomUUID();
-    const agentId = randomUUID();
-    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+  it("is a no-op 200 for a healthy agent with nothing to clear", async () => {
+    // AND-47: this used to be a 409. A manager recovering a report should not
+    // have to know whether the agent already recovered itself.
+    const { agentId } = await seedAgent({ status: "idle" });
 
-    await db.insert(companies).values({
-      id: companyId,
-      name: "Paperclip",
-      issuePrefix,
-      requireBoardApprovalForNewAgents: false,
+    const cleared = await agentService(db).clearError(agentId);
+    expect(cleared).toMatchObject({ id: agentId, status: "idle", errorReason: null });
+  });
+
+  it("scrubs a stale errorReason from a running agent without changing its status", async () => {
+    // AND-47: the auto-retry moved the agent to `running` while the failed
+    // run's reason was still on the row. Clearing must remove the lie and
+    // leave the live status alone -- forcing a running agent to `idle` would
+    // be a worse bug than the one being fixed.
+    const { agentId } = await seedAgent({
+      status: "running",
+      errorReason: "Process lost -- child pid 79801 is no longer running",
     });
 
-    await db.insert(agents).values({
-      id: agentId,
-      companyId,
-      name: "CodexCoder",
-      role: "engineer",
-      status: "idle",
-      adapterType: "codex_local",
-      adapterConfig: {},
-      runtimeConfig: {},
-      permissions: {},
-    });
+    const cleared = await agentService(db).clearError(agentId);
+    expect(cleared).toMatchObject({ id: agentId, status: "running", errorReason: null });
 
-    await expect(agentService(db).clearError(agentId)).rejects.toMatchObject({
-      status: 409,
-      message: "Only agents in error status can have their error cleared",
-    });
+    const row = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(row).toEqual({ status: "running", errorReason: null });
   });
 
   it("keeps resume-style terminal and pending-approval protections", async () => {

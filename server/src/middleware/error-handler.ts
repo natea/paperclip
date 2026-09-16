@@ -87,6 +87,46 @@ function recordResponsibleUserDenialFromHttpError(
   });
 }
 
+/**
+ * AND-14: body-parser rejects a request before any route runs, and its errors
+ * are plain `SyntaxError`s that fell through to the generic 500 branch. A
+ * caller then cannot tell "your body is not JSON" from "the server broke", so
+ * an agent that mangled its own payload retries the same mangled payload. Give
+ * the failure the same three obligations every other denial carries: what
+ * fired, and the path forward, behind a `code` the caller can branch on.
+ */
+function readBodyParserError(err: unknown): { status: number; code: string; sanctionedPath: string } | null {
+  if (!err || typeof err !== "object") return null;
+  const candidate = err as { type?: unknown; status?: unknown; statusCode?: unknown; body?: unknown };
+  if (typeof candidate.type !== "string" || !("body" in candidate)) return null;
+  const status = typeof candidate.status === "number"
+    ? candidate.status
+    : typeof candidate.statusCode === "number" ? candidate.statusCode : 400;
+  switch (candidate.type) {
+    case "entity.too.large":
+      return {
+        status,
+        code: "request_body_too_large",
+        sanctionedPath: "Split the payload — post long prose as a separate comment rather than inline — and retry.",
+      };
+    case "encoding.unsupported":
+    case "charset.unsupported":
+      return {
+        status,
+        code: "unsupported_request_encoding",
+        sanctionedPath: "Send the body as UTF-8 JSON with `Content-Type: application/json` and retry.",
+      };
+    default:
+      return {
+        status,
+        code: "malformed_request_body",
+        sanctionedPath:
+          "Re-encode the body as valid JSON and retry. Multi-line prose must escape its newlines " +
+          "(`\\n` inside the string), so build the payload with a JSON serializer rather than by hand.",
+      };
+  }
+}
+
 export function errorHandler(
   err: unknown,
   req: Request,
@@ -145,6 +185,21 @@ export function errorHandler(
   const zodIssues = readZodIssues(err);
   if (zodIssues) {
     res.status(400).json({ error: "Validation error", details: zodIssues });
+    return;
+  }
+
+  const bodyParserError = readBodyParserError(err);
+  if (bodyParserError) {
+    const reason = err instanceof Error ? err.message : String(err);
+    res.status(bodyParserError.status).json({
+      error: `Request body could not be read. ${bodyParserError.sanctionedPath}`,
+      code: bodyParserError.code,
+      details: {
+        code: bodyParserError.code,
+        reason,
+        sanctionedPath: bodyParserError.sanctionedPath,
+      },
+    });
     return;
   }
 

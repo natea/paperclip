@@ -4,7 +4,7 @@ import { accessSync, chmodSync, constants, mkdirSync, readFileSync } from "node:
 import { dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import type { AdapterExecutionResult } from "@paperclipai/adapter-utils";
+import type { AdapterExecutionResult, RunProcessSpawnMeta } from "@paperclipai/adapter-utils";
 import type { Db } from "@paperclipai/db";
 
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
@@ -197,11 +197,7 @@ export async function executeNativeCodexRunner(input: {
   /** Internal conformance seam; production always launches `codex app-server`. */
   providerLaunch?: NativeRunnerProviderLaunch;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
-  onSpawn: (meta: {
-    pid: number;
-    processGroupId: number | null;
-    startedAt: string;
-  }) => Promise<void>;
+  onSpawn: (meta: RunProcessSpawnMeta) => Promise<void>;
 }): Promise<AdapterExecutionResult> {
   const binary = input.runnerBinary ?? resolvePaperclipRunnerBinary();
   const runnerDigest = `sha256:${createHash("sha256").update(readFileSync(binary)).digest("hex")}`;
@@ -276,6 +272,11 @@ export async function executeNativeCodexRunner(input: {
       pid: child.pid,
       processGroupId: process.platform === "win32" ? null : child.pid,
       startedAt: new Date().toISOString(),
+      // The runner is spawned detached as its own group leader, so it outlives
+      // a server restart and can be adopted. Its lane is neither the provider
+      // CLI nor ACP, so only the topology is recorded here.
+      processTopology:
+        process.platform === "win32" ? "server_stdio" : "detached",
     });
     const completed = await Promise.race([
       prepared.waitForTerminal(input.timeoutMs),

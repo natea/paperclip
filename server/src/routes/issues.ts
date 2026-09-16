@@ -103,6 +103,7 @@ import {
   type SuggestTasksInteraction,
   type SuccessfulRunHandoffState,
   type WorkspaceRuntimeService,
+  isIssueWriteDenialCode,
   issueWriteDenialCodeForResponsibleUserDenial,
   issueWriteDenialResponse,
   type IssueWriteDenialCode,
@@ -180,6 +181,11 @@ import {
   normalizeUploadAttachmentContentType,
   SVG_CONTENT_TYPE,
 } from "../attachment-types.js";
+import {
+  evaluateIssueClosePushState,
+  isAttributablePushStateSkip,
+  type PushStateProbe,
+} from "../services/issue-close-push-state.js";
 import { queueIssueAssignmentWakeup } from "../services/issue-assignment-wakeup.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
 import { notifySecretProposalResolution } from "../services/secret-proposal-notifications.js";
@@ -200,11 +206,13 @@ import {
 import { decisionTrainingService } from "../services/decision-training.js";
 import { feedbackService } from "../services/feedback.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
+import { bindRunToIssue } from "../services/run-issue-binding.js";
 import {
   ISSUE_BLOCKER_DIAGNOSTICS_MAX_BLOCKERS,
   ISSUE_WAKE_DIAGNOSTICS_LOOKBACK_DAYS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_ACTIVITY_RECORDS,
   ISSUE_WAKE_DIAGNOSTICS_MAX_WAKE_REQUESTS,
+  logExecutionLockLoss,
   readAcceptedPlanConfirmationTarget,
   type IssuePostCommitAction,
 } from "../services/issues.js";
@@ -264,6 +272,10 @@ import {
   observeCrossIssueInfluence,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
+import {
+  recordIssueWriteDenial,
+  type IssueWriteChannel,
+} from "../services/issue-write-denial-record.js";
 import {
   getNativeSessionSteeringState,
   NativeSessionSteeringError,
@@ -3024,6 +3036,13 @@ export function issueRoutes(
     return resolveActorSourceTrustForIssue({ db, issue, actor });
   }
 
+  /** Pull the machine-readable denial code back off a thrown `HttpError`. */
+  function issueWriteDenialCodeFromThrown(err: unknown): IssueWriteDenialCode | null {
+    const details = (err as { details?: unknown } | null)?.details;
+    const code = (details as { code?: unknown } | null)?.code;
+    return typeof code === "string" && isIssueWriteDenialCode(code) ? code : null;
+  }
+
   async function assertCrossIssueInfluenceWithinRunCap(
     req: Request,
     res: Response,
@@ -3031,25 +3050,64 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
-    if (!req.actor.agentId || !req.actor.runId) throw crossIssueInfluenceRunContextError();
+    if (!req.actor.agentId || !req.actor.runId) {
+      // AND-29: this is the AND-16/AND-23 shape -- the assignee's own comment
+      // refused on its own task because the run context did not resolve. It
+      // throws rather than returning, so without recording here the refusal
+      // leaves no trace at all and reads downstream as silence.
+      await recordIssueWriteDenial(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        agentId: req.actor.agentId ?? null,
+        code: "cross_issue_influence_run_context_required",
+        channel: kind,
+        carriedRunId: req.actor.runId ?? null,
+      });
+      throw crossIssueInfluenceRunContextError();
+    }
 
     // The counter transaction locks and validates the persisted run before it
     // derives the source issue. Never trust the API-key run header by itself.
-    const decision = await observeCrossIssueInfluence(db, {
-      companyId: issue.companyId,
-      runId: req.actor.runId,
-      agentId: req.actor.agentId,
-      responsibleUserId: req.actor.onBehalfOfUserId ?? null,
-      targetIssueId: issue.id,
-      targetIssueIdentifier: issue.identifier ?? null,
-      kind,
-    });
+    let decision: Awaited<ReturnType<typeof observeCrossIssueInfluence>>;
+    try {
+      decision = await observeCrossIssueInfluence(db, {
+        companyId: issue.companyId,
+        runId: req.actor.runId,
+        agentId: req.actor.agentId,
+        responsibleUserId: req.actor.onBehalfOfUserId ?? null,
+        targetIssueId: issue.id,
+        targetIssueIdentifier: issue.identifier ?? null,
+        kind,
+      });
+    } catch (err) {
+      // AND-29: these throws are the AND-16/AND-23 cause -- a run id that does
+      // not resolve, or a run with no task bound, refusing the assignee on its
+      // own issue. Record the refusal on the way past so it is evidence rather
+      // than silence, then let the original error reach the error handler.
+      const deniedCode = issueWriteDenialCodeFromThrown(err);
+      if (deniedCode) {
+        await recordIssueWriteDenial(db, {
+          companyId: issue.companyId,
+          issueId: issue.id,
+          agentId: req.actor.agentId,
+          code: deniedCode,
+          channel: kind,
+          carriedRunId: req.actor.runId,
+        });
+      }
+      throw err;
+    }
     if (!decision || decision.allowed) return true;
 
     const labels = await issueWriteDenialLabels(req, {
       identifier: issue.identifier ?? null,
       assigneeAgentId: null,
     });
+    // No `issue.write_denied` row here: `observeCrossIssueInfluence` already
+    // wrote `issue.cross_issue_influence_cap_rejected` for this same refusal,
+    // and a second row would double-count it in the activity feed. The cap only
+    // ever fires on a *cross*-issue write, so it is not the shape AND-29's
+    // no-comment-streak read cares about in the first place.
     res.status(429).json(crossIssueInfluenceLimitError(decision, {
       actorLabel: labels.actorLabel,
       issueIdentifier: labels.issueIdentifier,
@@ -3627,7 +3685,6 @@ export function issueRoutes(
     actorType: "agent" | "user";
     actorId: string;
     actorAgentId?: string | null;
-    actorRunId?: string | null;
     reviewInteractionId?: string;
   }) {
     const nextStatus = typeof input.updateFields.status === "string"
@@ -3639,15 +3696,9 @@ export function issueRoutes(
     const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
     const pendingInteractions = interactions.filter((interaction) => interaction.status === "pending");
     if (input.reviewInteractionId) {
-      const designatedReviewConfirmation = pendingInteractions.find((interaction) =>
-        interaction.id === input.reviewInteractionId
-        && (interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation")
-        && (
-          input.actorType === "agent"
-            ? interaction.createdByAgentId === input.actorAgentId
-              && interaction.sourceRunId === input.actorRunId
-            : interaction.createdByUserId === input.actorId
-        )
+      type PendingInteraction = (typeof pendingInteractions)[number];
+      const isBindableConfirmation = (interaction: PendingInteraction) =>
+        (interaction.kind === "request_confirmation" || interaction.kind === "request_checkbox_confirmation")
         && !(
           interaction.kind === "request_confirmation"
           && interaction.payload
@@ -3656,13 +3707,35 @@ export function issueRoutes(
             ("toolAction" in interaction.payload && interaction.payload.toolAction !== undefined)
             || ("secretProposal" in interaction.payload && interaction.payload.secretProposal !== undefined)
           )
-        )
+        );
+      // The binding is agent-scoped, not run-scoped. Runs are per heartbeat, so the
+      // sanctioned continuation pattern (open a confirmation, resume on the next wake)
+      // names a card from an earlier run of the same agent. Cross-agent binding stays
+      // refused: that is the authorization boundary this guard exists for.
+      const isOwnedByActor = (interaction: PendingInteraction) =>
+        input.actorType === "agent"
+          ? typeof input.actorAgentId === "string"
+            && input.actorAgentId.length > 0
+            && interaction.createdByAgentId === input.actorAgentId
+          : interaction.createdByUserId === input.actorId;
+      const namedInteraction = pendingInteractions.find((interaction) =>
+        interaction.id === input.reviewInteractionId
       );
+      const designatedReviewConfirmation = namedInteraction
+          && isBindableConfirmation(namedInteraction)
+          && isOwnedByActor(namedInteraction)
+        ? namedInteraction
+        : undefined;
       if (!designatedReviewConfirmation) {
         const creatorDescription = input.actorType === "agent"
-          ? "this agent run"
+          ? "this agent"
           : "this user";
-        throw unprocessable(`reviewInteractionId must identify a pending non-tool confirmation created by ${creatorDescription}`, {
+        const ownershipDetail = namedInteraction
+          && isBindableConfirmation(namedInteraction)
+          && !isOwnedByActor(namedInteraction)
+          ? `; that confirmation was created by ${input.actorType === "agent" ? "another agent" : "another writer"}`
+          : "";
+        throw unprocessable(`reviewInteractionId must identify a pending non-tool confirmation created by ${creatorDescription}${ownershipDetail}`, {
           code: "invalid_review_interaction",
           reviewInteractionId: input.reviewInteractionId,
         });
@@ -4006,16 +4079,35 @@ export function issueRoutes(
     };
   }
 
-  /** Respond to a denied issue write with copy that names boundary, who, and path. */
+  /**
+   * Respond to a denied issue write with copy that names boundary, who, and path,
+   * and leave a durable trace of the refusal on the task.
+   *
+   * AND-29: the trace is the point. Productivity review's `no_comment_streak`
+   * counts *persisted* assignee comments, so before this every refusal here was
+   * invisible to it and an agent whose channel was closed scored exactly like an
+   * agent that never tried.
+   */
   async function denyIssueWrite(
     req: Request,
     res: Response,
-    issue: { identifier?: string | null; assigneeAgentId: string | null },
+    issue: { id?: string; companyId?: string; identifier?: string | null; assigneeAgentId: string | null },
     code: IssueWriteDenialCode,
     extraDetails: Record<string, unknown> = {},
+    channel: IssueWriteChannel = "update",
   ) {
     const labels = await issueWriteDenialLabels(req, issue);
     const { status, body } = issueWriteDenialResponse(code, labels);
+    if (issue.id && issue.companyId && req.actor.type === "agent") {
+      await recordIssueWriteDenial(db, {
+        companyId: issue.companyId,
+        issueId: issue.id,
+        agentId: req.actor.agentId ?? null,
+        code,
+        channel,
+        carriedRunId: req.actor.runId ?? null,
+      });
+    }
     res.status(status).json({
       error: body.error,
       details: { ...body.details, ...extraDetails },
@@ -4085,7 +4177,7 @@ export function issueRoutes(
     }
     const boundaryDecision = await decideIssueAccess(req, issue, "issue:comment");
     if (!boundaryDecision.allowed) {
-      return denyIssueWrite(req, res, issue, issueWriteDenialCodeForDecision(boundaryDecision));
+      return denyIssueWrite(req, res, issue, issueWriteDenialCodeForDecision(boundaryDecision), {}, "comment");
     }
     return boundaryDecision;
   }
@@ -4195,13 +4287,36 @@ export function issueRoutes(
         return true;
       }
       if (issue.status === "in_progress") {
-        // Run/checkout ownership stays assignee-scoped even though writes are
-        // open, so this lock clears on its own — the copy routes to comments.
-        return denyIssueWrite(req, res, issue, "issue_write_assignee_run_lock", {
-          issueId: issue.id,
-          assigneeAgentId: issue.assigneeAgentId,
-          actorAgentId,
-        });
+        // AND-12: the lock is run-scoped, not status-scoped. Clear whichever
+        // locks point at a terminal (or missing) run first, then judge the
+        // refusal against what is genuinely still held — otherwise a run that
+        // dies mid-flight refuses every non-assignee actor forever, while the
+        // denial copy below promises the lock "clears on its own".
+        const heldRunLocks = await svc.releaseTerminalRunLocks(issue.id);
+        if (heldRunLocks.checkoutRunId || heldRunLocks.executionRunId) {
+          // AND-50: a non-assignee actor refused by a live lock is the other
+          // face of silent lock loss — record who holds it and who was refused.
+          logExecutionLockLoss({
+            cause: "non_assignee_run_lock",
+            issueId: issue.id,
+            companyId: issue.companyId,
+            identifier: issue.identifier ?? null,
+            issueStatus: issue.status,
+            assigneeAgentId: issue.assigneeAgentId,
+            currentCheckoutRunId: heldRunLocks.checkoutRunId,
+            currentExecutionRunId: heldRunLocks.executionRunId,
+            actorAgentId,
+            actorRunId: req.actor.runId ?? null,
+            detail: "non-assignee write refused while a live run holds the issue lock",
+          });
+          // Run/checkout ownership stays assignee-scoped even though writes are
+          // open, so this lock clears on its own — the copy routes to comments.
+          return denyIssueWrite(req, res, issue, "issue_write_assignee_run_lock", {
+            issueId: issue.id,
+            assigneeAgentId: issue.assigneeAgentId,
+            actorAgentId,
+          });
+        }
       }
       // Past the run lock the issue is idle, so only channels that have not
       // adopted the default-open rule still refuse another agent's issue.
@@ -7460,7 +7575,6 @@ export function issueRoutes(
             actorType: actor.actorType,
             actorId: actor.actorId,
             actorAgentId: actor.agentId,
-            actorRunId: actor.runId,
           });
           const executionPolicy = normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
           const transition = applyIssueExecutionPolicyTransition({
@@ -10319,7 +10433,6 @@ export function issueRoutes(
       actorType: actor.actorType,
       actorId: actor.actorId,
       actorAgentId: actor.agentId,
-      actorRunId: actor.runId,
       reviewInteractionId: requestedReviewInteractionId,
     });
     const enteringReviewRequested =
@@ -11485,6 +11598,85 @@ export function issueRoutes(
       }
     })();
 
+    // AND-73: push-state guard at close. Our done-criteria are commit-local, so
+    // an issue can close green while its commits are unreachable from the branch
+    // a reviewer reads (AND-71 lost ten of them that way). Flag, never block —
+    // every degradation path inside the guard resolves to a null warning.
+    let pushStateWarning: string | null = null;
+    let pushStateProbe: PushStateProbe | null = null;
+    if (existing.status !== "done" && issue.status === "done") {
+      const guardInput = {
+        companyId: issue.companyId,
+        executionWorkspaceId: issue.executionWorkspaceId,
+        projectId: issue.projectId,
+        projectWorkspaceId: issue.projectWorkspaceId,
+      };
+      const pushState = await evaluateIssueClosePushState(db, guardInput);
+      pushStateWarning = pushState.warning;
+      pushStateProbe = pushState.probe;
+      // AND-77: record every outcome, not just the gap. A guard whose skip is
+      // indistinguishable from its all-clear cannot be trusted the first time it
+      // is quiet — the reason, the checkout it read, and which hop chose that
+      // checkout are the three facts needed to tell those apart afterwards.
+      logger.info({
+        issueId: issue.id,
+        identifier: issue.identifier,
+        probeKind: pushState.probe.kind,
+        probeReason: pushState.probe.kind === "skipped" ? pushState.probe.reason : null,
+        repoPath: pushState.repoPath,
+        repoPathSource: pushState.repoPathSource,
+        projectId: issue.projectId ?? null,
+        projectWorkspaceId: issue.projectWorkspaceId ?? null,
+        executionWorkspaceId: issue.executionWorkspaceId ?? null,
+      }, "push-state guard evaluated at issue close");
+      if (isAttributablePushStateSkip(pushState.probe, guardInput)) {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.push_state_skipped",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            reason: pushState.probe.reason,
+            repoPath: pushState.repoPath,
+            repoPathSource: pushState.repoPathSource,
+            projectId: issue.projectId ?? null,
+            projectWorkspaceId: issue.projectWorkspaceId ?? null,
+            executionWorkspaceId: issue.executionWorkspaceId ?? null,
+          },
+        }).catch((err) =>
+          logger.warn({ err, issueId: issue.id }, "failed to log push-state skip at issue close"));
+      }
+      if (pushState.probe.kind === "gap") {
+        await logActivity(db, {
+          companyId: issue.companyId,
+          actorType: actor.actorType,
+          actorId: actor.actorId,
+          agentId: actor.agentId,
+          runId: actor.runId,
+          agentApiKeyId: actor.agentApiKeyId,
+          action: "issue.push_state_gap",
+          entityType: "issue",
+          entityId: issue.id,
+          details: {
+            identifier: issue.identifier,
+            branch: pushState.probe.branch,
+            remoteRef: pushState.probe.remoteRef,
+            aheadCount: pushState.probe.aheadCount,
+            repoPath: pushState.repoPath,
+            repoPathSource: pushState.repoPathSource,
+            warning: pushStateWarning,
+          },
+        }).catch((err) =>
+          logger.warn({ err, issueId: issue.id }, "failed to log push-state gap at issue close"));
+      }
+    }
+
     await queueTaskWatchdogEvaluation(issue, actor.runId);
     const changes = issueResponse.changes ?? {};
     if (prefersMinimalIssueUpdateResponse(req)) {
@@ -11495,10 +11687,18 @@ export function issueRoutes(
         updatedAt: issueResponse.updatedAt,
         changes,
         comment,
+        ...(pushStateWarning ? { pushStateWarning } : {}),
+        ...(pushStateProbe ? { pushStateProbe } : {}),
       });
       return;
     }
-    res.json({ ...issueResponse, changes, comment });
+    res.json({
+      ...issueResponse,
+      changes,
+      comment,
+      ...(pushStateWarning ? { pushStateWarning } : {}),
+      ...(pushStateProbe ? { pushStateProbe } : {}),
+    });
   });
 
   router.delete("/issues/:id", async (req, res) => {
@@ -11624,6 +11824,31 @@ export function issueRoutes(
       throw error;
     }
     const actor = getActorInfo(req);
+    // AND-22: checking an issue out *is* the run declaring its task, so record
+    // it in the run's context. A scheduler-driven heartbeat wakes with no issue
+    // in `contextSnapshot`; without this it can move an issue to `in_progress`
+    // and then be refused every comment or status update that would explain or
+    // undo that (`cross_issue_influence_run_not_task_bound`), whose sanctioned
+    // path is this checkout. Binding is one-way, so it cannot be used to
+    // re-point a run at each target in turn and evade the cross-issue cap.
+    if (updated && checkoutRunId && req.actor.type === "agent" && req.actor.agentId) {
+      try {
+        const binding = await bindRunToIssue(db, {
+          companyId: issue.companyId,
+          runId: checkoutRunId,
+          agentId: req.actor.agentId,
+          issueId: issue.id,
+          source: "issue.checkout",
+        });
+        if (binding.outcome === "bound") {
+          logger.debug({ runId: checkoutRunId, issueId: issue.id }, "bound run to checked-out issue");
+        }
+      } catch (err) {
+        // Never fail an otherwise-successful checkout on the binding: the write
+        // path degrades to the pre-AND-22 behaviour, it does not break.
+        logger.warn({ err, runId: checkoutRunId, issueId: issue.id }, "failed to bind run to checked-out issue");
+      }
+    }
     if (updated?.harnessKind === "skill_test") {
       await companySkillsSvc.markTestRunRunning(updated.companyId, updated.id);
     }
@@ -13234,7 +13459,7 @@ export function issueRoutes(
         surface: "issue.comment.create",
         requestedValue: readNonEmptyString(req.body.onBehalfOfUserId),
       });
-      await denyIssueWrite(req, res, issue, "issue_write_attribution_spoof_rejected");
+      await denyIssueWrite(req, res, issue, "issue_write_attribution_spoof_rejected", {}, "comment");
       return;
     }
     const commentAccessDecision = await assertAgentIssueCommentAllowed(req, res, issue);

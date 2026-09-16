@@ -57,6 +57,7 @@ export const issueBlockedInboxReasonSchema = z.enum([
   "blocked_chain_stalled",
   "invalid_review_participant",
   "in_review_without_action_path",
+  "unassigned_without_wake_path",
   "missing_successful_run_disposition",
   "pending_board_decision",
   "pending_user_decision",

@@ -42,4 +42,28 @@ describe("resolveServerDevWatchIgnorePaths", () => {
     expect(ignorePaths).toContain("**/{node_modules,bower_components,vendor}/**");
     expect(ignorePaths).toContain("**/.vite-temp/**");
   });
+
+  // AND-18: the watcher's test-source exclusions are the reason an agent can
+  // edit a server test without SIGTERMing its own run. They are plain strings
+  // in a Set, so a refactor can drop one silently and the only symptom is that
+  // agent runs start dying on save again -- the exact failure AND-18 filed.
+  // Pin every glob the exclusion depends on.
+  it("excludes test sources, which are never in the running server's module graph", () => {
+    const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-dev-watch-tests-"));
+    const serverRoot = path.join(tempRoot, "repo", "server");
+    fs.mkdirSync(serverRoot, { recursive: true });
+
+    const ignorePaths = resolveServerDevWatchIgnorePaths(serverRoot);
+
+    for (const glob of [
+      "**/__tests__/**",
+      "**/*.test.ts",
+      "**/*.test.tsx",
+      "**/*.test.mts",
+      "**/*.test.js",
+    ]) {
+      expect(ignorePaths).toContain(glob);
+    }
+  });
+
 });

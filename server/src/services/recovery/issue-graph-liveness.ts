@@ -9,7 +9,8 @@ export type IssueLivenessState =
   | "blocked_by_uninvokable_assignee"
   | "blocked_by_cancelled_issue"
   | "invalid_review_participant"
-  | "in_review_without_action_path";
+  | "in_review_without_action_path"
+  | "unassigned_without_wake_path";
 
 export interface IssueLivenessIssueInput {
   id: string;
@@ -20,6 +21,9 @@ export interface IssueLivenessIssueInput {
   projectId?: string | null;
   goalId?: string | null;
   parentId?: string | null;
+  // Callers whose issue set omits terminal issues (the blocked inbox filters `status != done`)
+  // can still report a parent that is already closed, which is the stranded-child signal below.
+  parentStatus?: string | null;
   assigneeAgentId?: string | null;
   assigneeUserId?: string | null;
   createdByAgentId?: string | null;
@@ -191,7 +195,23 @@ function monitorFromIssue(issue: IssueLivenessIssueInput) {
   return { policyMonitor, stateMonitor };
 }
 
+// Mirrors the row predicate `tickDueIssueMonitors` selects on (heartbeat.ts). A monitor the
+// scheduler will never claim is not a wake path, however healthy its schedule looks.
+const SCHEDULABLE_MONITOR_STATUSES = new Set(["in_progress", "in_review"]);
+
+// An issue in one of these statuses with no assignee at all has no scheduler that will ever
+// claim it: agent heartbeats wake on assignment, so nothing owns the next action.
+const UNASSIGNED_WAKELESS_STATUSES = new Set(["backlog", "todo"]);
+
+export function isSchedulableIssueMonitorAssignment(issue: IssueLivenessIssueInput) {
+  if (issue.assigneeUserId) return false;
+  if (!issue.assigneeAgentId) return false;
+  return SCHEDULABLE_MONITOR_STATUSES.has(issue.status);
+}
+
 export function hasScheduledIssueMonitorPath(issue: IssueLivenessIssueInput, now: Date | string | number) {
+  if (!isSchedulableIssueMonitorAssignment(issue)) return false;
+
   const nowMs = typeof now === "number" ? now : readDateMs(now) ?? Date.now();
   const nextCheckAtMs = readDateMs(issue.monitorNextCheckAt);
   if (nextCheckAtMs === null || nextCheckAtMs <= nowMs) return false;
@@ -474,6 +494,9 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
   const agentsById = new Map(input.agents.map((agent) => [agent.id, agent]));
   const blockersByBlockedIssueId = new Map<string, IssueLivenessRelationInput[]>();
   const unresolvedBlockers = new Set<string>();
+  // Issues that already surface through the blocked-chain scan on some live dependent. Reporting
+  // them a second time as standalone unassigned findings would double-count the same stall.
+  const blockersWithLiveDependents = new Set<string>();
   const findings: IssueLivenessFinding[] = [];
   const activeRuns = input.activeRuns ?? [];
   const queuedWakeRequests = input.queuedWakeRequests ?? [];
@@ -498,6 +521,18 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       blocked.status === "blocked"
     ) {
       unresolvedBlockers.add(blocker.id);
+    }
+    if (
+      blocker &&
+      blocked &&
+      blocker.companyId === relation.companyId &&
+      blocked.companyId === relation.companyId &&
+      blocker.status !== "done" &&
+      blocker.status !== "cancelled" &&
+      blocked.status !== "done" &&
+      blocked.status !== "cancelled"
+    ) {
+      blockersWithLiveDependents.add(blocker.id);
     }
   }
 
@@ -573,12 +608,14 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       });
     }
 
-    if (!reviewIssue.assigneeAgentId || reviewIssue.assigneeUserId) return null;
+    if (reviewIssue.assigneeUserId) return null;
 
     return finding({
       issue: source,
       state: "in_review_without_action_path",
-      reason: `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`,
+      reason: reviewIssue.assigneeAgentId
+        ? `${issueLabel(reviewIssue)} is in review with an agent assignee but no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`
+        : `${issueLabel(reviewIssue)} is in review with no assignee at all and no participant, interaction, approval, user owner, wake, active run, or recovery issue owning the next action.`,
       dependencyPath,
       recoveryIssue: reviewIssue,
       recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
@@ -586,6 +623,41 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       recommendedAction:
         `Review ${issueLabel(reviewIssue)} and make the next action explicit: add a reviewer/interaction, return it to active work with a change request, mark it done if accepted, or open a bounded recovery issue.`,
       blockerIssueId: reviewIssue.id,
+    });
+  }
+
+  function unassignedWakePathFinding(
+    issue: IssueLivenessIssueInput,
+  ): IssueLivenessFinding | null {
+    if (!UNASSIGNED_WAKELESS_STATUSES.has(issue.status)) return null;
+    if (blockersWithLiveDependents.has(issue.id)) return null;
+    if (issue.assigneeAgentId || issue.assigneeUserId) return null;
+    if (hasExplicitWaitingPath(issue)) return null;
+
+    const parent = issue.parentId ? issuesById.get(issue.parentId) : null;
+    const parentStatus = parent?.companyId === issue.companyId
+      ? parent.status
+      : issue.parentStatus ?? null;
+    // A child left unassigned under a parent that already closed is the split-out-and-stranded
+    // shape (AND-48/AND-49): nobody is coming back to it, so it outranks an ordinary cold backlog.
+    const strandedUnderClosedParent = parentStatus === "done";
+
+    const ownerCandidates = ownerCandidatesForRecoveryIssue(issue, input.agents, agentsById);
+
+    return finding({
+      issue,
+      state: "unassigned_without_wake_path",
+      severity: strandedUnderClosedParent ? "critical" : "warning",
+      reason: strandedUnderClosedParent
+        ? `${issueLabel(issue)} is unassigned in ${issue.status} under a parent that already reached done, so no agent will ever wake on it.`
+        : `${issueLabel(issue)} is unassigned in ${issue.status} with no user owner, wake, active run, interaction, approval, monitor, or recovery issue owning the next action.`,
+      dependencyPath: [issue],
+      recoveryIssue: issue,
+      recommendedOwnerCandidateAgentIds: ownerCandidates.map((candidate) => candidate.agentId),
+      recommendedOwnerCandidates: ownerCandidates,
+      recommendedAction:
+        `Assign ${issueLabel(issue)} to an owner who can pick it up, give it a human owner or interaction if it is intentionally parked, or cancel it if it is no longer required.`,
+      blockerIssueId: issue.id,
     });
   }
 
@@ -724,10 +796,16 @@ export function classifyIssueGraphLiveness(input: IssueGraphLivenessInput): Issu
       if (chainFinding) findings.push(chainFinding);
     }
 
-    if (issue.status === "in_review" && !chainFinding && !unresolvedBlockers.has(issue.id)) {
+    if (chainFinding || unresolvedBlockers.has(issue.id)) continue;
+
+    if (issue.status === "in_review") {
       const review = reviewFinding(issue, issue, [issue]);
       if (review) findings.push(review);
+      continue;
     }
+
+    const unassigned = unassignedWakePathFinding(issue);
+    if (unassigned) findings.push(unassigned);
   }
 
   return findings;

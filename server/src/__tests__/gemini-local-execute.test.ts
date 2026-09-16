@@ -3,10 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execute } from "@paperclipai/adapter-gemini-local/server";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 async function writeFakeGeminiCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
+  const script = `const fs = require("node:fs");
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
@@ -35,8 +35,7 @@ console.log(JSON.stringify({
   result: "ok",
 }));
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 async function writeFailingGeminiCommand(
@@ -52,8 +51,7 @@ async function writeFailingGeminiCommand(
   const stdout = options.stdout ?? "";
   const stderr = options.stderr ?? "";
   const exit = options.exitCode ?? 1;
-  const script = `#!/usr/bin/env node
-for (const line of ${JSON.stringify(stdoutLines.map((line) => JSON.stringify(line)))}) {
+  const script = `for (const line of ${JSON.stringify(stdoutLines.map((line) => JSON.stringify(line)))}) {
   console.log(line);
 }
 if (${JSON.stringify(stdout)}) {
@@ -64,8 +62,7 @@ if (${JSON.stringify(stderr)}) {
 }
 process.exit(${exit});
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 type CapturePayload = {

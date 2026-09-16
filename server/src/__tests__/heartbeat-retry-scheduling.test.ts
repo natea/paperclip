@@ -2306,4 +2306,95 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
       retryNotBefore.toISOString(),
     );
   });
+
+  // AND-17 ask 1: with `maxConcurrentRuns: 1`, a continuation wake for a second
+  // issue must wait for the slot, never take it. The filed hypothesis was that
+  // each wake killed the other issue's in-flight run, which would leave neither
+  // issue able to reach a comment or a status write. The scheduler already
+  // queues instead; this pins that down so the behaviour cannot regress into
+  // the livelock the issue describes.
+  it("queues a second issue's continuation wake instead of preempting the in-flight run", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const inFlightRunId = randomUUID();
+    const inFlightIssueId = randomUUID();
+    const secondIssueId = randomUUID();
+    const now = new Date("2026-09-05T20:00:00.000Z");
+
+    await seedRetryFixture({
+      runId: inFlightRunId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "provider_quota",
+      adapterType: PROVIDER_QUOTA_TEST_ADAPTER,
+    });
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(issues).values([
+      {
+        id: inFlightIssueId,
+        companyId,
+        title: "First in-flight issue",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+        startedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      },
+      {
+        id: secondIssueId,
+        companyId,
+        title: "Second issue waiting for the slot",
+        status: "in_progress",
+        priority: "medium",
+        assigneeAgentId: agentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+        startedAt: now,
+        createdAt: now,
+        updatedAt: now,
+      },
+    ]);
+
+    // seedRetryFixture seeds a terminal run; this test needs the slot actually
+    // held, so promote it to the in-flight shape a live run has.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        startedAt: now,
+        finishedAt: null,
+        error: null,
+        errorCode: null,
+        resultJson: null,
+        contextSnapshot: { issueId: inFlightIssueId, wakeReason: "issue_continuation_needed" },
+      })
+      .where(eq(heartbeatRuns.id, inFlightRunId));
+
+    const wake = await heartbeat.wakeup(agentId, {
+      source: "assignment",
+      triggerDetail: "system",
+      reason: "issue_continuation_needed",
+      contextSnapshot: { issueId: secondIssueId, wakeReason: "issue_continuation_needed" },
+    });
+
+    const inFlight = await heartbeat.getRun(inFlightRunId);
+    expect(inFlight?.status).toBe("running");
+    expect(inFlight?.errorCode ?? null).toBeNull();
+    expect(inFlight?.finishedAt ?? null).toBeNull();
+
+    expect(wake?.id).toBeDefined();
+    expect(wake?.id).not.toBe(inFlightRunId);
+    const queued = await heartbeat.getRun(wake!.id);
+    expect(queued?.status).toBe("queued");
+
+    // Release the slot so teardown's quiescence drain has nothing to wait on.
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "cancelled", finishedAt: new Date(now.getTime() + 1_000) })
+      .where(inArray(heartbeatRuns.id, [inFlightRunId, wake!.id]));
+  });
 });

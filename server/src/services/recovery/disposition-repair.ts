@@ -12,6 +12,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { parseIssueExecutionState } from "../issue-execution-policy.js";
+import { hasScheduledIssueMonitorPath } from "./issue-graph-liveness.js";
 
 const ACTIVE_RUN_STATUSES = ["queued", "running", "scheduled_retry"] as const;
 
@@ -73,6 +74,31 @@ export function dispositionRepairDelayMs(attempt: number, fingerprint: string) {
     DISPOSITION_REPAIR_BASE_DELAYS_MS,
     "disposition repair",
   );
+}
+
+/**
+ * A monitor only counts as a durable waiting path when `tickDueIssueMonitors` would actually
+ * claim the row (AND-50). A future `monitorNextCheckAt` on an issue outside the scheduler's
+ * assignment/status predicate never fires, so treating it as a path parks the issue invisibly.
+ */
+export function durableWaitingPathReason(input: {
+  issue: DispositionRepairIssue;
+  hasBlocker: boolean;
+  hasPendingExecutionStage: boolean;
+  pendingInteraction: boolean;
+  pendingApproval: boolean;
+  now?: Date;
+}): string | null {
+  const { issue } = input;
+  if (issue.assigneeUserId) return "user_owner";
+  if (input.hasBlocker) return "blocker";
+  if (hasScheduledIssueMonitorPath({ ...issue, identifier: null, title: "" }, input.now ?? new Date())) {
+    return "monitor";
+  }
+  if (input.hasPendingExecutionStage) return "execution_stage";
+  if (input.pendingInteraction) return "interaction";
+  if (input.pendingApproval) return "approval";
+  return null;
 }
 
 export async function collectDispositionRepairSourceState(
@@ -193,19 +219,13 @@ export async function collectDispositionRepairSourceState(
   const pendingApproval = linkedApprovals.some((row) =>
     row.status === "pending" || row.status === "revision_requested",
   );
-  const durablePathReason = issue.assigneeUserId
-    ? "user_owner"
-    : blockers.length > 0
-      ? "blocker"
-      : issue.monitorNextCheckAt && issue.monitorNextCheckAt.getTime() > Date.now()
-        ? "monitor"
-        : pendingExecutionState?.status === "pending"
-          ? "execution_stage"
-          : pendingInteraction
-            ? "interaction"
-            : pendingApproval
-              ? "approval"
-              : null;
+  const durablePathReason = durableWaitingPathReason({
+    issue,
+    hasBlocker: blockers.length > 0,
+    hasPendingExecutionStage: pendingExecutionState?.status === "pending",
+    pendingInteraction,
+    pendingApproval,
+  });
 
   const durableState = {
     source: {

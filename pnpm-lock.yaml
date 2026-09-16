@@ -502,6 +502,9 @@ importers:
       '@paperclipai/paperclip-eval-kernel':
         specifier: workspace:*
         version: link:../paperclip-eval-kernel
+      '@paperclipai/shared':
+        specifier: workspace:*
+        version: link:../shared
       '@playwright/test':
         specifier: ^1.61.1
         version: 1.62.1

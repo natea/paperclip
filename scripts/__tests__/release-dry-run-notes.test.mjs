@@ -67,7 +67,10 @@ set_public_package_version() { :; }
 
   writeExecutable(
     join(scriptsDir, "release-registry-versions.mjs"),
-    `#!/usr/bin/env node
+    // Pin the interpreter rather than resolving `node` off PATH — see
+    // `@paperclipai/shared/testing/node-script-fixture` (AND-62). This file is a
+    // node:test script outside the workspace graph, so it inlines the shebang.
+    `#!${process.execPath}
 const [mode] = process.argv.slice(2);
 if (mode === "fetch") {
   process.stdout.write('{"paperclipai":[]}\\n');

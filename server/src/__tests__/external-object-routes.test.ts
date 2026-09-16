@@ -11,6 +11,12 @@ const ownerRunId = "55555555-5555-4555-8555-555555555555";
 const mockIssueService = vi.hoisted(() => ({
   assertCheckoutOwner: vi.fn(),
   getById: vi.fn(),
+  // AND-12: the non-assignee run lock releases terminal runs before denying, so
+  // the checkout this suite asserts on has to report as genuinely live.
+  releaseTerminalRunLocks: vi.fn(async () => ({
+    checkoutRunId: "run-live-1",
+    executionRunId: null,
+  })),
 }));
 
 const mockAccessService = vi.hoisted(() => ({

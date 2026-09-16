@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { and, eq, or, inArray, sql } from "drizzle-orm";
+import { and, eq, getTableName, or, inArray, sql } from "drizzle-orm";
 import {
   afterAll,
   afterEach,
@@ -113,6 +113,7 @@ import {
   INTERACTION_CONTINUATION_INFRA_RETRY_REASON,
   INTERACTION_CONTINUATION_INFRA_WAKE_REASON,
   heartbeatService,
+  persistHeartbeatRunProcessMetadata,
   redactDetectedSuccessfulRunProgressSummaryForBoard,
   redactSuccessfulRunHandoffEvidence,
 } from "../services/heartbeat.ts";
@@ -121,6 +122,7 @@ import {
   resolveLegacyHotRestartIntentPath,
   resolveHotRestartReportPath,
   writeHotRestartIntent,
+  writeHotRestartShutdownSnapshot,
 } from "../services/hot-restart.ts";
 import { secretService } from "../services/secrets.ts";
 import {
@@ -330,6 +332,78 @@ async function spawnOrphanedProcessGroup() {
   };
 }
 
+// The teardown below waits on two 5s idle budgets and then clears every fixture
+// table. Inheriting the file-wide 30s `hookTimeout` gave all 130 tests in this
+// suite one shared budget, so on a loaded machine the hook was killed
+// mid-teardown — leaving rows behind and failing the *next* test with a bogus
+// assertion. Give the hook its own, larger budget (AND-35).
+const TEARDOWN_TIMEOUT_MS = 60_000;
+
+// Every table seeded by this suite's fixtures, cleared between tests. Order is
+// irrelevant: a single `TRUNCATE ... CASCADE` resolves foreign keys itself, so
+// this replaces ~30 sequential deletes wrapped in four 5-attempt retry loops
+// that existed only to survive FK ordering races (AND-35). `authUsers` is
+// deliberately absent — `beforeAll` seeds `responsible-user` once and every
+// test depends on it surviving. CASCADE only truncates tables that *reference*
+// these, never their parents, so that row is safe.
+const FIXTURE_TABLES = [
+  activityLog,
+  agentRuntimeState,
+  agentWakeupRequests,
+  agents,
+  budgetPolicies,
+  companySecretBindings,
+  companySecrets,
+  companySkills,
+  companies,
+  costEvents,
+  documentAnnotationAnchorSnapshots,
+  documentAnnotationComments,
+  documentAnnotationThreads,
+  documentRevisions,
+  documents,
+  environmentLeases,
+  environments,
+  executionWorkspaces,
+  heartbeatRunEvents,
+  heartbeatRuns,
+  issueComments,
+  issueDocuments,
+  issuePlanDecompositions,
+  issueRecoveryActions,
+  issueRelations,
+  issueThreadInteractions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
+  issueWorkProducts,
+  issues,
+  plugins,
+  projectWorkspaces,
+  projects,
+  workspaceOperations,
+];
+
+async function truncateFixtureTables(db: ReturnType<typeof createDb>) {
+  const targets = FIXTURE_TABLES.map(
+    (table) => `"${getTableName(table)}"`,
+  ).join(", ");
+  // A recovery child process that outlived the idle wait can still hold a row
+  // lock. TRUNCATE needs ACCESS EXCLUSIVE, so bound the wait and retry rather
+  // than blocking until the hook times out.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      await db.transaction(async (tx) => {
+        await tx.execute(sql.raw("SET LOCAL lock_timeout = '2s'"));
+        await tx.execute(sql.raw(`TRUNCATE TABLE ${targets} CASCADE`));
+      });
+      return;
+    } catch (error) {
+      if (attempt === 4) throw error;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+}
+
 describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   let db!: ReturnType<typeof createDb>;
   let tempDb: Awaited<
@@ -411,91 +485,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await new Promise((resolve) => setTimeout(resolve, 50));
     await waitForHeartbeatIdle(db, 5_000);
     await new Promise((resolve) => setTimeout(resolve, 100));
-    await db.delete(activityLog);
-    await db.delete(agentRuntimeState);
-    await db.delete(companySkills);
-    await db.delete(costEvents);
-    await db.delete(workspaceOperations);
-    await db.delete(environmentLeases);
-    await db.delete(environments);
-    await db.delete(plugins);
-    await db.delete(issuePlanDecompositions);
-    await db.delete(issueThreadInteractions);
-    await db.delete(documentAnnotationComments);
-    await db.delete(documentAnnotationAnchorSnapshots);
-    await db.delete(documentAnnotationThreads);
-    await db.delete(issueWorkProducts);
-    await db.delete(issueComments);
-    await db.delete(issueDocuments);
-    await db.delete(documentRevisions);
-    await db.delete(documents);
-    await db.delete(issueRelations);
-    await db.delete(issueRecoveryActions);
-    await db.delete(issueTreeHoldMembers);
-    await db.delete(issueTreeHolds);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(issueComments);
-      await db.delete(issueDocuments);
-      try {
-        await db.delete(issues);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(activityLog);
-      await db.delete(heartbeatRunEvents);
-      try {
-        await db.delete(heartbeatRuns);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    await db.delete(agentWakeupRequests);
-    await db.delete(budgetPolicies);
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      // A still-alive recovery child process can insert a new wakeup request
-      // or runtime-state row after the first delete. Re-clear both rows each
-      // attempt so a late insert cannot hold the agents foreign key.
-      await db.delete(agentWakeupRequests);
-      await db.delete(agentRuntimeState);
-      try {
-        await db.delete(agents);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-    for (let attempt = 0; attempt < 5; attempt += 1) {
-      await db.delete(companySkills);
-      await db.delete(workspaceOperations);
-      await db.delete(executionWorkspaces);
-      await db.delete(projectWorkspaces);
-      await db.delete(projects);
-      await db.delete(issuePlanDecompositions);
-      await db.delete(issueThreadInteractions);
-      await db.delete(documentAnnotationComments);
-      await db.delete(documentAnnotationAnchorSnapshots);
-      await db.delete(documentAnnotationThreads);
-      await db.delete(issueDocuments);
-      await db.delete(documentRevisions);
-      await db.delete(documents);
-      await db.delete(companySecretBindings);
-      await db.delete(companySecrets);
-      try {
-        await db.delete(companies);
-        break;
-      } catch (error) {
-        if (attempt === 4) throw error;
-        await new Promise((resolve) => setTimeout(resolve, 50));
-      }
-    }
-  });
+    await truncateFixtureTables(db);
+  }, TEARDOWN_TIMEOUT_MS);
 
   afterAll(async () => {
     for (const child of childProcesses) {
@@ -1184,7 +1175,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .then((rows) => rows.map((row) => row.blockerIssueId));
   }
 
-  async function seedQueuedIssueRunFixture() {
+  async function seedQueuedIssueRunFixture(
+    options: { withIssue?: boolean } = {},
+  ) {
+    const withIssue = options.withIssue ?? true;
     const companyId = randomUUID();
     const agentId = randomUUID();
     const runId = randomUUID();
@@ -1225,7 +1219,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       source: "assignment",
       triggerDetail: "system",
       reason: "issue_assigned",
-      payload: { issueId },
+      payload: withIssue ? { issueId } : {},
       status: "queued",
       runId,
       requestedAt: now,
@@ -1240,14 +1234,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       triggerDetail: "system",
       status: "queued",
       wakeupRequestId,
-      contextSnapshot: {
-        issueId,
-        taskId: issueId,
-        wakeReason: "issue_assigned",
-      },
+      contextSnapshot: withIssue
+        ? {
+            issueId,
+            taskId: issueId,
+            wakeReason: "issue_assigned",
+          }
+        : {},
       updatedAt: now,
       createdAt: now,
     });
+
+    if (!withIssue) {
+      return { companyId, agentId, runId, wakeupRequestId, issueId: null };
+    }
 
     await db.insert(issues).values({
       id: issueId,
@@ -1324,6 +1324,225 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(missingCommentWakeups).toHaveLength(0);
     expect(agent).toEqual({ status: "running", errorReason: null });
   });
+
+  it("clears the stale errorReason when the process-loss retry starts successfully", async () => {
+    // AND-47: `error` is an invokable status, so the retry run flips the agent
+    // straight from `error` to `running`. That write used to carry the dead
+    // run's errorReason forward onto a perfectly healthy agent, and
+    // `clear-error` then refused to scrub it.
+    const { agentId, runId } = await seedQueuedIssueRunFixture();
+
+    // Run 1 was launched and its child died without a terminal record.
+    await db
+      .update(heartbeatRuns)
+      .set({
+        status: "running",
+        processPid: 999_999_999,
+        processGroupId: 999_999_999,
+        startedAt: new Date("2026-03-19T00:00:00.000Z"),
+        updatedAt: new Date("2026-03-19T00:00:00.000Z"),
+      })
+      .where(eq(heartbeatRuns.id, runId));
+    await db
+      .update(agentWakeupRequests)
+      .set({ status: "claimed", claimedAt: new Date("2026-03-19T00:00:00.000Z") })
+      .where(eq(agentWakeupRequests.runId, runId));
+
+    const heartbeat = heartbeatService(db);
+    const reaped = await heartbeat.reapOrphanedRuns();
+    expect(reaped.runIds).toEqual([runId]);
+
+    const lostRun = await heartbeat.getRun(runId);
+    expect(lostRun).toMatchObject({ status: "failed", errorCode: "process_lost" });
+
+    // Precondition the fix depends on: the reap really did stamp a reason on
+    // the agent row. Without this the assertion below would pass vacuously.
+    const afterLoss = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(afterLoss?.errorReason).toContain("Process lost");
+
+    const retryRun = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.retryOfRunId, runId))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun).not.toBeNull();
+
+    // Probe the agent row from inside the adapter call: that is the window the
+    // bug lived in. Asserting only after the run settles would pass on the
+    // unfixed code too, because finalizeAgentStatus clears the reason on the
+    // way out of a successful run -- the whole complaint in AND-47 is that the
+    // agent advertises a dead failure for the entire time it is running.
+    let errorReasonWhileRunning: string | null | undefined;
+    let statusWhileRunning: string | undefined;
+    mockAdapterExecute.mockImplementationOnce(async () => {
+      const row = await db
+        .select({ status: agents.status, errorReason: agents.errorReason })
+        .from(agents)
+        .where(eq(agents.id, agentId))
+        .then((rows) => rows[0] ?? null);
+      errorReasonWhileRunning = row?.errorReason;
+      statusWhileRunning = row?.status;
+      return {
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+        errorMessage: null,
+        summary: "Recovered stranded heartbeat work.",
+        provider: "test",
+        model: "test-model",
+      };
+    });
+
+    // Run 2 succeeds.
+    if (retryRun?.status === "queued") {
+      await heartbeat.resumeQueuedRuns();
+    }
+    await waitForRunToSettle(heartbeat, retryRun!.id);
+    await heartbeat.waitForRunExecutionDrain(retryRun!.id);
+
+    expect(statusWhileRunning).toBe("running");
+    expect(errorReasonWhileRunning).toBeNull();
+
+    const recovered = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(recovered?.errorReason).toBeNull();
+    expect(recovered?.status).not.toBe("error");
+  });
+
+  it("files an escalation against the manager when an agent falls into error", async () => {
+    // AND-43 defect 2: the transition into `error` used to be silent -- the
+    // agent stopped heartbeating and the only signal was a human listing
+    // agents.
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 1,
+      signal: null,
+      timedOut: false,
+      errorMessage: "Adapter blew up",
+      provider: "test",
+      model: "test-model",
+    });
+
+    const { companyId, agentId, runId } = await seedQueuedIssueRunFixture({
+      withIssue: false,
+    });
+    const managerId = randomUUID();
+    await db.insert(agents).values({
+      id: managerId,
+      companyId,
+      name: "EngManager",
+      role: "manager",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      permissions: {},
+    });
+    await db
+      .update(agents)
+      .set({ reportsTo: managerId, updatedAt: new Date() })
+      .where(eq(agents.id, agentId));
+
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    const escalations = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "agent_error_escalation"),
+          eq(issues.originId, agentId),
+        ),
+      );
+    expect(escalations).toHaveLength(1);
+    expect(escalations[0]).toMatchObject({
+      priority: "critical",
+      assigneeAgentId: managerId,
+    });
+    // Filed open: the manager may already have picked it up by the time this
+    // reads, but it must not be born closed.
+    expect(["done", "cancelled"]).not.toContain(escalations[0]?.status);
+    expect(escalations[0]?.title).toContain("CodexCoder");
+    // The recovery route has to be in the escalation itself, not folded away
+    // in a doc the reader has to go find.
+    expect(escalations[0]?.description).toContain("/clear-error");
+    expect(escalations[0]?.description).toContain("/resume");
+
+    const managerWakeups = await db
+      .select({ id: agentWakeupRequests.id })
+      .from(agentWakeupRequests)
+      .where(
+        and(
+          eq(agentWakeupRequests.companyId, companyId),
+          eq(agentWakeupRequests.agentId, managerId),
+        ),
+      );
+    expect(managerWakeups.length).toBeGreaterThan(0);
+  });
+
+  it("records a run whose model finished cleanly as succeeded even when live background tasks forced a teardown kill", async () => {
+    // AND-43: the Claude CLI does not exit while it still holds live background
+    // tasks, so the runner signals it after the terminal result and the shell
+    // reports 143. Classifying that teardown as an adapter failure marked
+    // successful runs `failed` and flipped the agent into `error`.
+    mockAdapterExecute.mockResolvedValueOnce({
+      exitCode: 143,
+      signal: null,
+      timedOut: false,
+      errorMessage: null,
+      providerTerminalSuccess: true,
+      summary: "Progress comment posted.",
+      provider: "test",
+      model: "test-model",
+      resultJson: {
+        subtype: "success",
+        is_error: false,
+        unmanagedBackgroundTask: {
+          kind: "terminal_result_cleanup",
+          stopped: true,
+          stopReason: "unmanaged_background_task_stopped",
+          reason: "unmanaged background task stopped; no durable live path",
+          terminalResultSeen: true,
+          signal: "SIGTERM",
+          forceKilled: false,
+        },
+      },
+    });
+
+    const { agentId, runId } = await seedQueuedIssueRunFixture();
+    const heartbeat = heartbeatService(db);
+
+    await heartbeat.resumeQueuedRuns();
+    await waitForRunToSettle(heartbeat, runId);
+    await heartbeat.waitForRunExecutionDrain(runId);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run).toMatchObject({
+      status: "succeeded",
+      error: null,
+      errorCode: null,
+      // The raw exit code stays truthful for diagnostics.
+      exitCode: 143,
+    });
+
+    const agent = await db
+      .select({ status: agents.status, errorReason: agents.errorReason })
+      .from(agents)
+      .where(eq(agents.id, agentId))
+      .then((rows) => rows[0] ?? null);
+    expect(agent?.status).not.toBe("error");
+    expect(agent?.errorReason).toBeNull();
+  });
+
 
   it("keeps a local run active when the recorded pid is still alive", async () => {
     const child = spawnAliveProcess();
@@ -1673,6 +1892,186 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await fs.rm(home, { recursive: true, force: true });
     }
   }
+
+  it("records the spawn lane on the run and merges it into the existing context snapshot", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running" });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: 4321,
+      processGroupId: 4321,
+      startedAt: "2026-03-19T00:01:00.000Z",
+      executionEngine: "cli",
+      processTopology: "detached",
+    });
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+
+    expect(run?.processPid).toBe(4321);
+    expect(run?.contextSnapshot).toMatchObject({
+      executionEngine: "cli",
+      processTopology: "detached",
+    });
+    // The merge must not clobber keys other paths wrote on this same row.
+    expect(
+      (run?.contextSnapshot as Record<string, unknown>).issueId,
+    ).toEqual(expect.any(String));
+  });
+
+  it("leaves the spawn lane unset when the adapter does not report one", async () => {
+    const { runId } = await seedRunFixture({ agentStatus: "running" });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: 4322,
+      processGroupId: null,
+      startedAt: "2026-03-19T00:01:00.000Z",
+    });
+
+    const run = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+    const context = run?.contextSnapshot as Record<string, unknown>;
+
+    expect(context.executionEngine).toBeUndefined();
+    expect(context.processTopology).toBeUndefined();
+    expect(context.issueId).toEqual(expect.any(String));
+  });
+
+  it("adopts a detached CLI run whose lane was recorded by the spawn site", async () => {
+    // Regression: the lane fields were only ever read, never written, so a
+    // detached CLI run fell through to the adapterType fallback and was drained
+    // as if it were bound to this server's stdio. Drive the real writer here
+    // rather than hand-seeding the snapshot, which is what hid the defect.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+    });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: child.pid ?? 0,
+      processGroupId: child.pid ?? 0,
+      startedAt: "2026-03-19T00:01:00.000Z",
+      executionEngine: "cli",
+      processTopology: "detached",
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const result = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result.mode).toBe("hot_restart");
+      expect(result.skipDrain).toBe(true);
+      expect(isPidAlive(child.pid)).toBe(true);
+    });
+  });
+
+  it("drains an ACP run whose lane was recorded by the spawn site", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+    });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: child.pid ?? 0,
+      processGroupId: null,
+      startedAt: "2026-03-19T00:01:00.000Z",
+      executionEngine: "acp",
+      processTopology: "server_stdio",
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const result = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result.mode).toBe("acp_drain_required");
+      expect(result.skipDrain).toBe(false);
+      expect(result.drainRunIds).toEqual([runId]);
+    });
+  });
+
+  it("adopts a legacy claude_local run with no recorded lane that is its own process-group leader", async () => {
+    // Legacy rows predate the spawn sites recording a lane, and adapterConfig
+    // has no `engine` key by default. The observed process shape -- pid equal
+    // to its own process-group id -- is the recorded fact that keeps these
+    // runs from being drained during the rollout.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: child.pid ?? null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const result = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result.mode).toBe("hot_restart");
+      expect(result.activeRunIds).toEqual([runId]);
+      expect(isPidAlive(child.pid)).toBe(true);
+    });
+  });
+
+  it("still drains a legacy claude_local run with no recorded lane and no usable process group", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { runId } = await seedRunFixture({
+      adapterType: "claude_local",
+      agentStatus: "running",
+      processPid: child.pid ?? null,
+      processGroupId: null,
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-03-19T00:05:00.000Z"),
+      });
+
+      const result = await heartbeatService(db).prepareHotRestartShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+
+      expect(result.mode).toBe("acp_drain_required");
+      expect(result.drainRunIds).toEqual([runId]);
+    });
+  });
 
   it("captures a hot-restart shutdown snapshot without interrupting running runs", async () => {
     const child = spawnAliveProcess();
@@ -2061,6 +2460,134 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
   });
 
+  it("does not adopt a run whose recorded spawn time disagrees with the live pid", async () => {
+    // Regression (AND-40): liveness was `process.kill(pid, 0)` alone, so after a
+    // reboot or a pid wraparound an unrelated process holding the recycled pid
+    // got a dead run classified as adopted -- and the adopted run kept holding
+    // its issue's execution lock with nothing behind it.
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeGreaterThan(0);
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      agentStatus: "running",
+    });
+
+    // The recorded spawn time is hours before this child was forked: same pid,
+    // different process.
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: child.pid ?? 0,
+      processGroupId: null,
+      startedAt: "2026-03-19T00:01:00.000Z",
+    });
+
+    await withTempPaperclipHome(async (home) => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-08-01T00:05:00.000Z"),
+        preflightActiveRunIds: [runId],
+      });
+      const intent = await readHotRestartIntent();
+      if (!intent) throw new Error("hot-restart intent was not written");
+      await writeHotRestartShutdownSnapshot({
+        intent,
+        signal: "SIGTERM",
+        capturedAt: new Date("2026-08-01T00:06:00.000Z"),
+        activeRuns: [
+          {
+            runId,
+            companyId,
+            agentId,
+            adapterType: "codex_local",
+            status: "running",
+            processPid: child.pid ?? null,
+            processGroupId: null,
+            issueId,
+          },
+        ],
+      });
+
+      const heartbeat = heartbeatService(db);
+      const adoption = await heartbeat.reconcileHotRestartAdoption(
+        new Date("2026-08-01T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [],
+        finalizedWhileDownRunIds: [],
+        lostRunIds: [runId],
+      });
+
+      const report = JSON.parse(
+        await fs.readFile(resolveHotRestartReportPath(home), "utf8"),
+      ) as { runs?: Array<Record<string, unknown>> };
+      expect(report.runs).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            runId,
+            classification: "lost",
+            reason: "process_not_alive",
+          }),
+        ]),
+      );
+    });
+
+    // The unrelated pid holder is untouched -- we reclassified our own run, we
+    // did not signal somebody else's process.
+    expect(isPidAlive(child.pid)).toBe(true);
+  });
+
+  it("still adopts a run whose recorded spawn time matches the live pid", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      agentStatus: "running",
+    });
+
+    await persistHeartbeatRunProcessMetadata(db, runId, {
+      pid: child.pid ?? 0,
+      processGroupId: null,
+      startedAt: new Date().toISOString(),
+    });
+
+    await withTempPaperclipHome(async () => {
+      await writeHotRestartIntent({
+        previousServerPid: process.pid,
+        previousServerVersion: "old-version",
+        requestedAt: new Date("2026-08-01T00:05:00.000Z"),
+        preflightActiveRunIds: [runId],
+      });
+      const intent = await readHotRestartIntent();
+      if (!intent) throw new Error("hot-restart intent was not written");
+      await writeHotRestartShutdownSnapshot({
+        intent,
+        signal: "SIGTERM",
+        capturedAt: new Date("2026-08-01T00:06:00.000Z"),
+        activeRuns: [
+          {
+            runId,
+            companyId,
+            agentId,
+            adapterType: "codex_local",
+            status: "running",
+            processPid: child.pid ?? null,
+            processGroupId: null,
+            issueId,
+          },
+        ],
+      });
+
+      const adoption = await heartbeatService(db).reconcileHotRestartAdoption(
+        new Date("2026-08-01T00:07:00.000Z"),
+      );
+      expect(adoption).toMatchObject({
+        mode: "reported",
+        adoptedRunIds: [runId],
+        lostRunIds: [],
+      });
+    });
+  });
+
   it("reports preflight live runs as lost when the shutdown snapshot is missing", async () => {
     const { runId } = await seedRunFixture({
       agentStatus: "running",
@@ -2150,6 +2677,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
   it("persists codex_local spawn identity before hot restart and never loses the live run for missing metadata", async () => {
     let releaseAdapter: (() => void) | null = null;
     let spawnedPid: number | null = null;
+    // The spawn time has to be the child's real one: liveness now compares it
+    // against the start time the OS reports for the pid, so a fabricated clock
+    // here would look exactly like a recycled pid (AND-40).
+    let spawnedStartedAt: string | null = null;
     const adapterStarted = new Promise<void>((resolve) => {
       mockAdapterExecute.mockImplementationOnce(async (rawInput?: unknown) => {
         const input = rawInput as {
@@ -2164,10 +2695,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         if (!child.pid)
           throw new Error("Test codex_local child did not expose a pid");
         spawnedPid = child.pid;
+        spawnedStartedAt = new Date().toISOString();
         await input.onSpawn?.({
           pid: child.pid,
           processGroupId: null,
-          startedAt: new Date("2026-07-30T07:00:00.000Z").toISOString(),
+          startedAt: spawnedStartedAt,
         });
         resolve();
         await new Promise<void>((release) => {
@@ -2226,7 +2758,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "running",
       processPid: spawnedPid,
       processGroupId: null,
-      processStartedAt: new Date("2026-07-30T07:00:00.000Z"),
+      processStartedAt: new Date(spawnedStartedAt as unknown as string),
     });
 
     await withTempPaperclipHome(async (home) => {
@@ -2476,6 +3008,117 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.checkoutRunId).toBeNull();
     expect(issue?.executionRunId).toBe(retryRun?.id);
   });
+
+  async function spawnDetachedGroupLeader() {
+    const child = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { detached: true, stdio: "ignore" },
+    );
+    child.unref();
+    const pid = child.pid ?? null;
+    if (!pid) throw new Error("failed to spawn detached process group leader");
+    cleanupPids.add(pid);
+    // A detached child leads its own process group, so pid === pgid. That is
+    // the shape the dev-watch preservation gate keys on.
+    return pid;
+  }
+
+  it.skipIf(process.platform === "win32")(
+    "leaves detached agent runs alive when a dev-watch restart SIGTERMs the server",
+    async () => {
+      const pid = await spawnDetachedGroupLeader();
+      const { agentId, runId, issueId, wakeupRequestId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: pid,
+        processGroupId: pid,
+      });
+      const heartbeat = heartbeatService(db);
+
+      vi.stubEnv("PAPERCLIP_DEV_WATCH", "1");
+      try {
+        const result = await heartbeat.drainRunningRunsForShutdown(
+          "SIGTERM",
+          new Date("2026-03-19T00:06:00.000Z"),
+        );
+        expect(result.interrupted).toBe(0);
+        expect(result.preservedRunIds).toEqual([runId]);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+
+      expect(isPidAlive(pid)).toBe(true);
+
+      // No interrupt, no retry run, and the issue keeps its checkout: the run
+      // is still live and will be reconciled by the next server boot.
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(1);
+      expect(runs[0]).toMatchObject({ id: runId, status: "running" });
+
+      const wakeup = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wakeupRequestId))
+        .then((rows) => rows[0] ?? null);
+      expect(wakeup?.status).toBe("claimed");
+
+      const issue = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId))
+        .then((rows) => rows[0] ?? null);
+      expect(issue?.checkoutRunId).toBe(runId);
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still drains detached agent runs on an operator SIGINT under dev-watch",
+    async () => {
+      const pid = await spawnDetachedGroupLeader();
+      const { runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: pid,
+        processGroupId: pid,
+      });
+      const heartbeat = heartbeatService(db);
+
+      vi.stubEnv("PAPERCLIP_DEV_WATCH", "1");
+      try {
+        const result = await heartbeat.drainRunningRunsForShutdown(
+          "SIGINT",
+          new Date("2026-03-19T00:06:00.000Z"),
+        );
+        expect(result.interrupted).toBe(1);
+        expect(result.interruptedRunIds).toEqual([runId]);
+      } finally {
+        vi.unstubAllEnvs();
+      }
+    },
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still drains agent runs on SIGTERM when the server is not under dev-watch",
+    async () => {
+      const pid = await spawnDetachedGroupLeader();
+      const { runId } = await seedRunFixture({
+        agentStatus: "running",
+        processPid: pid,
+        processGroupId: pid,
+      });
+      const heartbeat = heartbeatService(db);
+
+      const result = await heartbeat.drainRunningRunsForShutdown(
+        "SIGTERM",
+        new Date("2026-03-19T00:06:00.000Z"),
+      );
+      expect(result.interrupted).toBe(1);
+      expect(result.interruptedRunIds).toEqual([runId]);
+    },
+  );
+
 
   it("does not overwrite a run that is no longer running during graceful shutdown drain", async () => {
     const { runId, wakeupRequestId } = await seedRunFixture({
@@ -3004,6 +3647,79 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       .from(issueComments)
       .where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);
+  });
+
+  it("does not demote an issue whose pending wake interaction outlived the lost run", async () => {
+    // AND-11: a board card with a wake continuation policy is a live execution
+    // path. The stranded-issue sweep already honours it; immediate terminal-run
+    // recovery must agree, or a card that outlives a process restart is read as
+    // "no execution path" and the waiting issue is demoted to blocked.
+    const { companyId, agentId, runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: 999_999_999,
+      processLossRetryCount: 1,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      requestedResolverPolicy: "human_only",
+      effectiveResolverPolicy: "human_only",
+      title: "Which recovery path should this issue take?",
+      createdByAgentId: agentId,
+      payload: { version: 1, questions: [] },
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns();
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const issue = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    // Waiting on the card, not blocked, and the checkout lock is still released.
+    expect(issue?.status).toBe("in_progress");
+    expect(issue?.executionRunId).toBeNull();
+    expect(issue?.checkoutRunId).toBeNull();
+
+    // No recovery run, no stranded-recovery issue, no blocked notice comment.
+    const runs = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(1);
+    expect(runs[0]?.status).toBe("failed");
+
+    const recoveryIssues = await db
+      .select()
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, "stranded_issue_recovery"),
+        ),
+      );
+    expect(recoveryIssues).toHaveLength(0);
+
+    const comments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    // The card itself is untouched, so answering it still wakes the assignee.
+    const interactions = await db
+      .select()
+      .from(issueThreadInteractions)
+      .where(eq(issueThreadInteractions.issueId, issueId));
+    expect(interactions).toHaveLength(1);
+    expect(interactions[0]?.status).toBe("pending");
   });
 
   it("schedules a bounded retry for codex transient upstream failures instead of blocking the issue immediately", async () => {

@@ -120,16 +120,21 @@ describeEmbeddedPostgres("productivity review service", () => {
     count: number;
     now: Date;
     withRunComments?: boolean;
+    status?: "succeeded" | "failed" | "interrupted";
+    errorCode?: string;
+    /** Widen to push the runs out of the high-churn windows. */
+    spacingMs?: number;
   }) {
     const runs: Array<typeof heartbeatRuns.$inferInsert> = [];
     for (let index = 0; index < input.count; index += 1) {
       const runId = randomUUID();
-      const createdAt = new Date(input.now.getTime() - index * 60_000);
+      const createdAt = new Date(input.now.getTime() - index * (input.spacingMs ?? 60_000));
       runs.push({
         id: runId,
         companyId: input.companyId,
         agentId: input.agentId,
-        status: "succeeded",
+        status: input.status ?? "succeeded",
+        errorCode: input.errorCode ?? null,
         invocationSource: "assignment",
         triggerDetail: "system",
         startedAt: createdAt,
@@ -158,6 +163,39 @@ describeEmbeddedPostgres("productivity review service", () => {
     }
 
     return runs;
+  }
+
+  /**
+   * The AND-16/AND-23 shape: the assignee posted a comment every heartbeat and
+   * the write guard refused each one, so nothing reached `issue_comments` and
+   * the only trace is the denial activity row.
+   */
+  async function insertCommentDenials(input: {
+    companyId: string;
+    agentId: string;
+    issueId: string;
+    runs: Array<typeof heartbeatRuns.$inferInsert>;
+    code?: string;
+    carriedRunId?: string | null;
+  }) {
+    await db.insert(activityLog).values(
+      input.runs.map((run) => ({
+        companyId: input.companyId,
+        actorType: "agent" as const,
+        actorId: input.agentId,
+        agentId: input.agentId,
+        action: "issue.write_denied",
+        entityType: "issue",
+        entityId: input.issueId,
+        details: {
+          source: "issue_write_denial",
+          code: input.code ?? "cross_issue_influence_run_context_required",
+          channel: "comment",
+          carriedRunId: input.carriedRunId === undefined ? (run.id as string) : input.carriedRunId,
+        },
+        createdAt: new Date((run.createdAt as Date).getTime() + 1_000),
+      })),
+    );
   }
 
   async function listProductivityReviews(companyId: string) {
@@ -482,6 +520,149 @@ describeEmbeddedPostgres("productivity review service", () => {
     expect(await listProductivityReviews(seeded.companyId)).toHaveLength(4);
   });
 
+  // AND-29 gap 2. AND-16 and AND-23 were filed against agents that commented on
+  // every heartbeat and were refused every time: the runs succeeded, billed real
+  // cost, and left no comment rows, so the streak read them as ten silent runs.
+  it("does not fire a no-comment streak when the assignee's comment writes were refused", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const runs = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      spacingMs: 30 * 60_000,
+    });
+    await insertCommentDenials({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      runs,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+    expect(await listProductivityReviews(seeded.companyId)).toHaveLength(0);
+  });
+
+  // The denial carries a run id that resolves to nothing -- that is *why* it was
+  // refused -- so attribution has to fall back to the enclosing run interval.
+  it("recognises refused comment writes whose carried run id resolves to no run", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const runs = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      spacingMs: 30 * 60_000,
+    });
+    await insertCommentDenials({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      runs,
+      carriedRunId: null,
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(0);
+  });
+
+  // Negative twin: refusals on a *different* channel say nothing about whether
+  // the agent tried to comment, so the streak must still fire.
+  it("still fires the no-comment streak when only non-comment writes were refused", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const runs = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS,
+      now,
+      spacingMs: 30 * 60_000,
+    });
+    await db.insert(activityLog).values(
+      runs.map((run) => ({
+        companyId: seeded.companyId,
+        actorType: "agent" as const,
+        actorId: seeded.coderId,
+        agentId: seeded.coderId,
+        action: "issue.write_denied",
+        entityType: "issue",
+        entityId: seeded.issueId,
+        details: {
+          source: "issue_write_denial",
+          code: "issue_write_assignee_run_lock",
+          channel: "update",
+          carriedRunId: run.id as string,
+        },
+        createdAt: new Date((run.createdAt as Date).getTime() + 1_000),
+      })),
+    );
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).not.toContain("Read this as a closed channel");
+  });
+
+  // AND-29 gap 1, decided: file the review, waive the hold. Here the streak is
+  // long enough to fire on its own (partial refusals), so the review is created
+  // -- but the assignee is not stopped for a channel it does not control.
+  it("files a review but waives the continuation hold when the comment channel was refused", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    const runs = await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS + 4,
+      now,
+      spacingMs: 30 * 60_000,
+    });
+    // Only the oldest runs were refused; the newest ten are genuinely silent, so
+    // `no_comment_streak` still trips.
+    await insertCommentDenials({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      runs: runs.slice(DEFAULT_PRODUCTIVITY_REVIEW_NO_COMMENT_STREAK_RUNS),
+    });
+
+    const service = productivityReviewService(db);
+    const result = await service.reconcileProductivityReviews({ now, companyId: seeded.companyId });
+    const hold = await service.isProductivityReviewContinuationHoldActive({
+      companyId: seeded.companyId,
+      issueId: seeded.issueId,
+      agentId: seeded.coderId,
+      now,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `no_comment_streak`");
+    expect(review?.description).toContain("Read this as a closed channel, not silence.");
+    expect(review?.description).toContain("`cross_issue_influence_run_context_required`");
+    expect(review?.description).toContain("does **not** hold the assignee");
+    expect(hold.held).toBe(false);
+  });
+
   it("creates a long-active review without enabling a continuation hold", async () => {
     const now = new Date("2026-04-28T12:00:00.000Z");
     const seeded = await seedAssignedIssue({
@@ -548,6 +729,63 @@ describeEmbeddedPostgres("productivity review service", () => {
     const [review] = await listProductivityReviews(seeded.companyId);
     expect(review?.description).toContain("Primary trigger: `high_churn`");
     expect(review?.description).toContain("Runs in rolling windows: 10/1h");
+  });
+
+  // AND-17 ask 3: ten runs an hour that were all killed by the platform and
+  // billed nothing is contention, not an agent spinning. Without this label the
+  // review reads as an indictment of the assignee and sends its owner chasing
+  // agent behaviour instead of the restart source.
+  it("labels high churn as infrastructure contention when killed runs billed nothing", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      status: "failed",
+      errorCode: "process_signal_terminated",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Primary trigger: `high_churn`");
+    expect(review?.description).toContain("Infrastructure-terminated sampled runs: 10 of 10");
+    expect(review?.description).toContain("`process_signal_terminated`");
+    expect(review?.description).toContain("Read this as contention, not underperformance.");
+    expect(review?.description).toContain("likely infrastructure contention, not agent inefficiency");
+  });
+
+  it("does not label contention when the churning runs failed on their own", async () => {
+    const now = new Date("2026-04-28T12:00:00.000Z");
+    const seeded = await seedAssignedIssue();
+    await insertRuns({
+      companyId: seeded.companyId,
+      agentId: seeded.coderId,
+      issueId: seeded.issueId,
+      count: 10,
+      now,
+      withRunComments: true,
+      status: "failed",
+      errorCode: "some_adapter_error",
+    });
+
+    const result = await productivityReviewService(db).reconcileProductivityReviews({
+      now,
+      companyId: seeded.companyId,
+    });
+
+    expect(result.created).toBe(1);
+    const [review] = await listProductivityReviews(seeded.companyId);
+    expect(review?.description).toContain("Infrastructure-terminated sampled runs: 0 of 10");
+    expect(review?.description).not.toContain("Read this as contention");
   });
 
   it("ignores non-assignee comments when evaluating high-churn productivity reviews", async () => {

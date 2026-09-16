@@ -4051,6 +4051,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               pid: meta.pid,
               processGroupId: null,
               startedAt: meta.startedAt,
+              // The ACP lane drives the provider over a control channel owned
+              // by this server process, so the run cannot outlive a restart.
+              executionEngine: "acp",
+              processTopology: "server_stdio",
             });
           },
           getRuntimeParentContext,
@@ -4236,6 +4240,8 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               pid: processIdentitySink.latest.pid,
               processGroupId: null,
               startedAt: processIdentitySink.latest.startedAt,
+              executionEngine: "acp",
+              processTopology: "server_stdio",
             });
           }
         } catch (err) {

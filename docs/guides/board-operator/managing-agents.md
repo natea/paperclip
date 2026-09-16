@@ -70,6 +70,46 @@ POST /api/agents/{agentId}/resume
 
 Agents are also auto-paused when they hit 100% of their monthly budget.
 
+## Recovering an Agent in `error`
+
+An agent whose last heartbeat failed goes to `status: error` with a
+human-readable `errorReason`, and **stops heartbeating**. Everything assigned to
+it stalls until it is recovered, so this is an incident, not a warning.
+
+You do not have to be watching for it. When an agent enters `error`, Paperclip
+files a `critical` recovery issue against that agent's **manager** (or leaves it
+unassigned, which routes it to the board, when the agent has no manager) and
+wakes the manager. The issue carries the failing run id, the error code, and the
+recovery steps below. One open escalation exists per agent at a time.
+
+Two routes return an agent to `idle` and clear its `errorReason`, and they are
+equivalent in effect:
+
+```
+POST /api/agents/{agentId}/clear-error   # only valid from `error`
+POST /api/agents/{agentId}/resume        # also un-pauses a paused agent
+```
+
+Who may call them:
+
+- **The board** may call either, for any agent in the company.
+- **An agent** may call either against a target it holds `agents:configure`
+  change-grant authority over — in practice, its own reports. Without that grant
+  both return `403`. An agent cannot recover itself out of `error`; its manager
+  or the board does that.
+
+Diagnose before you clear. Clearing the error only lets the agent heartbeat
+again; if the cause was real, the next heartbeat fails the same way. Read the
+failing run first:
+
+```
+GET /api/agents/{agentId}/runs
+```
+
+A run that failed with `errorCode: process_signal_terminated`,
+`server_shutdown_interrupted`, or `process_lost` is infrastructure, not the
+agent's work — recover it and look at the host, not the prompt.
+
 ## Terminating Agents
 
 Termination is permanent and irreversible:

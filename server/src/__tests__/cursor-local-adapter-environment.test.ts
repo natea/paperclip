@@ -4,11 +4,11 @@ import os from "node:os";
 import path from "node:path";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { testEnvironment } from "@paperclipai/adapter-cursor-local/server";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 async function writeFakeAgentCommand(binDir: string, argsCapturePath: string): Promise<string> {
   const commandPath = path.join(binDir, "agent");
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
+  const script = `const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
   fs.writeFileSync(outPath, JSON.stringify(process.argv.slice(2)), "utf8");
@@ -23,14 +23,19 @@ console.log(JSON.stringify({
   result: "hello",
 }));
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
   return commandPath;
 }
 
 async function writeFakeCursorAgentCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
+  // The sandbox probe is handed the adapter config `env`, which deliberately
+  // carries no PATH, so the adapter falls back to `defaultPathForPlatform()`.
+  // That default does not contain a Node install on every dev box (nvm/volta/asdf
+  // all live under $HOME), and an env-shebang fixture then dies with
+  // `env: node: No such file or directory` during the version probe — a fixture
+  // failure that reads as an adapter bug. `writeExecutableNodeFixture` pins the
+  // interpreter, keeping this test about command resolution only.
+  const script = `const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
   fs.writeFileSync(outPath, JSON.stringify({
@@ -49,9 +54,7 @@ console.log(JSON.stringify({
   result: "hello",
 }));
 `;
-  await fs.mkdir(path.dirname(commandPath), { recursive: true });
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 function createLocalSandboxRunner() {

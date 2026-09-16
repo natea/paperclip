@@ -3,10 +3,10 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { execute } from "@paperclipai/adapter-pi-local/server";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 async function writeFakePiCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-if (process.argv.includes("--list-models")) {
+  const script = `if (process.argv.includes("--list-models")) {
   console.log("provider  model");
   console.log("google    gemini-3-flash-preview");
   process.exit(0);
@@ -23,13 +23,11 @@ console.log(JSON.stringify({
 }));
 process.exit(0);
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 async function writeEnvDumpPiCommand(commandPath: string, envDumpPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
+  const script = `const fs = require("node:fs");
 if (process.argv.includes("--list-models")) {
   console.log("provider  model");
   console.log("google    gemini-3-flash-preview");
@@ -42,8 +40,7 @@ console.log(JSON.stringify({ type: "turn_end", message: { role: "assistant", con
 console.log(JSON.stringify({ type: "agent_end", messages: [] }));
 process.exit(0);
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 describe("pi_local execute", () => {

@@ -69,6 +69,11 @@ import {
 import { conflict, HttpError, notFound, unprocessable } from "../errors.js";
 import { isForeignKeyViolation } from "../db-errors.js";
 import { logger } from "../middleware/logger.js";
+import {
+  buildExecutionLockLossEvent,
+  ExecutionLockLossLogGate,
+  type ExecutionLockLossInput,
+} from "./execution-lock-observability.js";
 import { parseObject } from "../adapters/utils.js";
 import {
   hydrateSuccessfulRunHandoffLiveness,
@@ -136,6 +141,19 @@ import {
 } from "./activity-log.js";
 import { buildIssueChanges } from "./issue-change-receipt.js";
 import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
+
+const executionLockLossGate = new ExecutionLockLossLogGate();
+
+/**
+ * AND-50: emit exactly one warning per distinct execution-lock loss. The
+ * symptom is a whole turn of refusals; the diagnosis is this single line.
+ */
+export function logExecutionLockLoss(input: ExecutionLockLossInput) {
+  const event = buildExecutionLockLossEvent(input);
+  if (!executionLockLossGate.shouldLog(event)) return;
+  logger.warn(event, "issue execution lock lost");
+}
+
 
 const ALL_ISSUE_STATUSES = ["backlog", "todo", "in_progress", "in_review", "blocked", "done", "cancelled"];
 const MAX_ISSUE_COMMENT_PAGE_LIMIT = 500;
@@ -3792,15 +3810,36 @@ function compareBlockedInboxRows(
   return right.id.localeCompare(left.id);
 }
 
-async function listIssueBlockedInboxAttentionMap(
+interface IssueGraphLivenessSnapshotRow {
+  companyId: string;
+  issueId: string | null;
+  agentId: string | null;
+  status: string;
+}
+
+export interface IssueGraphLivenessSnapshot {
+  graphIssues: IssueRow[];
+  issuesById: Map<string, IssueRow>;
+  findings: IssueLivenessFinding[];
+  activeRunRows: IssueGraphLivenessSnapshotRow[];
+  wakeRows: IssueGraphLivenessSnapshotRow[];
+  scheduledRetryRows: IssueGraphLivenessSnapshotRow[];
+  interactionRows: BlockedInboxInteractionRow[];
+  approvalRows: BlockedInboxApprovalRow[];
+}
+
+/**
+ * Build the company-wide input for `classifyIssueGraphLiveness` and run it.
+ *
+ * Extracted from `listIssueBlockedInboxAttentionMap` so the dashboard read path and the
+ * recovery reconciler that acts on `critical` findings (AND-56) classify from exactly the
+ * same graph. If they diverged, the escalation would fire on findings the board never sees
+ * -- or, worse, stay silent on the ones it does.
+ */
+async function computeIssueGraphLivenessSnapshot(
   dbOrTx: any,
   companyId: string,
-  issueRows: BlockedInboxIssueRow[],
-): Promise<Map<string, IssueBlockedInboxAttention>> {
-  const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
-  const result = new Map<string, IssueBlockedInboxAttention>();
-  if (rowIssueIds.length === 0) return result;
-
+): Promise<IssueGraphLivenessSnapshot> {
   const [graphIssueRows, graphRelationRows, companyAgentRows] = await Promise.all([
     dbOrTx
       .select()
@@ -3846,7 +3885,7 @@ async function listIssueBlockedInboxAttentionMap(
   const graphIssueIds = graphIssues.map((issue) => issue.id);
   const issuesById = new Map<string, IssueRow>(graphIssues.map((issue) => [issue.id, issue]));
 
-  const [activeRunRows, wakeRows, scheduledRetryRows, interactionRows, approvalRows, handoffMap] = await Promise.all([
+  const [activeRunRows, wakeRows, scheduledRetryRows, interactionRows, approvalRows] = await Promise.all([
     graphIssueIds.length === 0
       ? Promise.resolve([])
       : dbOrTx
@@ -3945,7 +3984,6 @@ async function listIssueBlockedInboxAttentionMap(
             inArray(approvals.status, [...BLOCKED_INBOX_PENDING_APPROVAL_STATUSES]),
             inArray(issueApprovals.issueId, graphIssueIds),
           )),
-    listSuccessfulRunHandoffMapForIssues(dbOrTx, companyId, rowIssueIds, { hydrateLiveness: false }),
   ]);
 
   const pendingInteractions = (interactionRows as BlockedInboxInteractionRow[]).map((row) => ({
@@ -3976,6 +4014,23 @@ async function listIssueBlockedInboxAttentionMap(
       return entries;
     });
 
+  // graphIssues excludes `done`, so a closed parent is invisible there. The unassigned-wake-path
+  // finding weights a stranded child by whether its parent already closed, so resolve those.
+  const missingParentIds = [...new Set(
+    graphIssues
+      .map((issue) => issue.parentId)
+      .filter((parentId): parentId is string => Boolean(parentId) && !issuesById.has(parentId!)),
+  )];
+  const closedParentStatusById = new Map<string, string>(
+    missingParentIds.length === 0
+      ? []
+      : ((await dbOrTx
+          .select({ id: issues.id, status: issues.status })
+          .from(issues)
+          .where(and(eq(issues.companyId, companyId), inArray(issues.id, missingParentIds)))) as Array<{ id: string; status: string }>)
+          .map((row) => [row.id, row.status] as const),
+  );
+
   const findings = classifyIssueGraphLiveness({
     issues: graphIssues.map((issue) => ({
       id: issue.id,
@@ -3986,6 +4041,7 @@ async function listIssueBlockedInboxAttentionMap(
       projectId: issue.projectId,
       goalId: issue.goalId,
       parentId: issue.parentId,
+      parentStatus: issue.parentId ? closedParentStatusById.get(issue.parentId) ?? null : null,
       assigneeAgentId: issue.assigneeAgentId,
       assigneeUserId: issue.assigneeUserId,
       createdByAgentId: issue.createdByAgentId,
@@ -4013,6 +4069,42 @@ async function listIssueBlockedInboxAttentionMap(
     openRecoveryIssues,
     now: new Date(),
   });
+
+  return {
+    graphIssues,
+    issuesById,
+    findings,
+    activeRunRows: activeRunRows as IssueGraphLivenessSnapshotRow[],
+    wakeRows: wakeRows as IssueGraphLivenessSnapshotRow[],
+    scheduledRetryRows: scheduledRetryRows as IssueGraphLivenessSnapshotRow[],
+    interactionRows: interactionRows as BlockedInboxInteractionRow[],
+    approvalRows: approvalRows as BlockedInboxApprovalRow[],
+  };
+}
+
+
+async function listIssueBlockedInboxAttentionMap(
+  dbOrTx: any,
+  companyId: string,
+  issueRows: BlockedInboxIssueRow[],
+): Promise<Map<string, IssueBlockedInboxAttention>> {
+  const rowIssueIds = [...new Set(issueRows.map((row) => row.id))];
+  const result = new Map<string, IssueBlockedInboxAttention>();
+  if (rowIssueIds.length === 0) return result;
+
+  const [snapshot, handoffMap] = await Promise.all([
+    computeIssueGraphLivenessSnapshot(dbOrTx, companyId),
+    listSuccessfulRunHandoffMapForIssues(dbOrTx, companyId, rowIssueIds, { hydrateLiveness: false }),
+  ]);
+  const {
+    issuesById,
+    findings,
+    activeRunRows,
+    wakeRows,
+    scheduledRetryRows,
+    interactionRows,
+    approvalRows,
+  } = snapshot;
   const findingByIssueId = new Map<string, IssueLivenessFinding>();
   for (const finding of findings) {
     if (!findingByIssueId.has(finding.issueId)) findingByIssueId.set(finding.issueId, finding);
@@ -4144,6 +4236,7 @@ async function listIssueBlockedInboxAttentionMap(
         ? issuesById.get(finding.dependencyPath[finding.dependencyPath.length - 1]!.issueId)
         : issuesById.get(finding.recoveryIssueId);
       const ownerAgentId = finding.state === "blocked_by_unassigned_issue"
+        || finding.state === "unassigned_without_wake_path"
         ? null
         : finding.recommendedOwnerAgentId ?? row.assigneeAgentId ?? leaf?.assigneeAgentId ?? null;
       result.set(row.id, attentionBase({
@@ -4152,6 +4245,10 @@ async function listIssueBlockedInboxAttentionMap(
         severity: finding.state === "blocked_by_assigned_backlog_issue"
           || finding.state === "in_review_without_action_path"
           ? "high"
+          // A cold unassigned backlog item is real but routine; only a child stranded under a
+          // closed parent (severity critical) is worth crowding the top of the inbox.
+          : finding.state === "unassigned_without_wake_path"
+          ? (finding.severity === "critical" ? "high" : "medium")
           : finding.severity === "critical" ? "critical" : "high",
         stoppedSinceAt: leaf?.updatedAt ?? row.updatedAt,
         owner: {
@@ -4175,6 +4272,8 @@ async function listIssueBlockedInboxAttentionMap(
                 return "Repair review participant";
               case "in_review_without_action_path":
                 return "Choose review path";
+              case "unassigned_without_wake_path":
+                return "Assign owner";
             }
           })(),
           detail: finding.recommendedAction,
@@ -5428,7 +5527,14 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ executionRunId: issues.executionRunId })
+        .select({
+          executionRunId: issues.executionRunId,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionLockedAt: issues.executionLockedAt,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5461,6 +5567,23 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
+      // AND-50: the moment the execution lock leaves a run. Without this the
+      // displaced run just starts collecting refusals with nothing naming why.
+      if (updated) {
+        logExecutionLockLoss({
+          cause: "terminal_run_swept",
+          issueId,
+          companyId: issue.companyId,
+          identifier: issue.identifier,
+          issueStatus: issue.status,
+          assigneeAgentId: issue.assigneeAgentId,
+          priorRunId: issue.executionRunId,
+          priorRunStatus: run?.status ?? "missing",
+          lockedAt: issue.executionLockedAt,
+          detail: "execution lock cleared because its holder run is terminal or missing",
+        });
+      }
+
       return Boolean(updated);
     });
   }
@@ -5476,7 +5599,15 @@ export function issueService(db: Db) {
         sql`select ${issues.id} from ${issues} where ${issues.id} = ${issueId} for update`,
       );
       const issue = await tx
-        .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+        .select({
+          checkoutRunId: issues.checkoutRunId,
+          executionRunId: issues.executionRunId,
+          companyId: issues.companyId,
+          identifier: issues.identifier,
+          status: issues.status,
+          assigneeAgentId: issues.assigneeAgentId,
+          executionLockedAt: issues.executionLockedAt,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
@@ -5525,8 +5656,48 @@ export function issueService(db: Db) {
         .returning({ id: issues.id })
         .then((rows) => rows[0] ?? null);
 
+      if (updated) {
+        logExecutionLockLoss({
+          cause: "terminal_run_swept",
+          issueId,
+          companyId: issue.companyId,
+          identifier: issue.identifier,
+          issueStatus: issue.status,
+          assigneeAgentId: issue.assigneeAgentId,
+          priorRunId: issue.checkoutRunId,
+          priorRunStatus: run?.status ?? "missing",
+          currentExecutionRunId: issue.executionRunId,
+          lockedAt: issue.executionLockedAt,
+          detail: "checkout lock cleared because its holder run is terminal or missing",
+        });
+      }
+
       return Boolean(updated);
     });
+  }
+
+  // Route-facing composite for the non-assignee run-lock boundary
+  // (assertAgentIssueMutationAllowed). The lock is run-scoped, not
+  // status-scoped: clear whichever locks point at a terminal (or missing)
+  // heartbeat run, then report what is genuinely still held so callers can deny
+  // on a live run only. Without this a run that dies, or that finishes without
+  // moving the issue out of `in_progress`, locks the issue against every
+  // non-assignee actor forever.
+  async function releaseTerminalRunLocks(issueId: string): Promise<{
+    checkoutRunId: string | null;
+    executionRunId: string | null;
+  }> {
+    await clearExecutionRunIfTerminal(issueId);
+    await clearCheckoutRunIfTerminal(issueId);
+    const row = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    return {
+      checkoutRunId: row?.checkoutRunId ?? null,
+      executionRunId: row?.executionRunId ?? null,
+    };
   }
 
   async function addStopRelayCommentIfNeeded(
@@ -5627,6 +5798,7 @@ export function issueService(db: Db) {
   return {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
+    releaseTerminalRunLocks,
     addStopRelayCommentIfNeeded,
 
     list: async (companyId: string, filters?: IssueFilters) => {
@@ -6624,6 +6796,19 @@ export function issueService(db: Db) {
       dbOrTx: any = db,
     ) => {
       return listIssueReviewAttentionMap(dbOrTx, companyId, issueRows);
+    },
+
+    /**
+     * Raw issue-graph liveness findings for a company, from the same snapshot the blocked
+     * inbox renders. The recovery reconciler consumes this to act on `critical` findings
+     * instead of leaving them as dashboard rows (AND-56).
+     */
+    listIssueGraphLivenessFindings: async (
+      companyId: string,
+      dbOrTx: any = db,
+    ): Promise<IssueLivenessFinding[]> => {
+      const snapshot = await computeIssueGraphLivenessSnapshot(dbOrTx, companyId);
+      return snapshot.findings;
     },
 
     listProductivityReviews: async (
@@ -8628,24 +8813,27 @@ export function issueService(db: Db) {
       if (!latest) throw notFound("Issue not found");
       const resolvedLatest = await resolveOwnership(latest);
       if (resolvedLatest.ownership) return resolvedLatest.ownership;
-      if (resolvedLatest.latest) {
-        throw conflict("Issue run ownership conflict", {
-          issueId: resolvedLatest.latest.id,
-          status: resolvedLatest.latest.status,
-          assigneeAgentId: resolvedLatest.latest.assigneeAgentId,
-          checkoutRunId: resolvedLatest.latest.checkoutRunId,
-          executionRunId: resolvedLatest.latest.executionRunId,
-          actorAgentId,
-          actorRunId,
-        });
-      }
-
+      const denied = resolvedLatest.latest ?? latest;
+      // AND-50: the run asked to write and does not hold the lock. Name the
+      // loss here so the refusal stream that follows has a documented origin.
+      logExecutionLockLoss({
+        cause: "ownership_conflict",
+        issueId: denied.id,
+        issueStatus: denied.status,
+        assigneeAgentId: denied.assigneeAgentId,
+        priorRunId: actorRunId,
+        currentCheckoutRunId: denied.checkoutRunId,
+        currentExecutionRunId: denied.executionRunId,
+        actorAgentId,
+        actorRunId,
+        detail: "actor run no longer holds the issue checkout/execution lock",
+      });
       throw conflict("Issue run ownership conflict", {
-        issueId: latest.id,
-        status: latest.status,
-        assigneeAgentId: latest.assigneeAgentId,
-        checkoutRunId: latest.checkoutRunId,
-        executionRunId: latest.executionRunId,
+        issueId: denied.id,
+        status: denied.status,
+        assigneeAgentId: denied.assigneeAgentId,
+        checkoutRunId: denied.checkoutRunId,
+        executionRunId: denied.executionRunId,
         actorAgentId,
         actorRunId,
       });

@@ -4,10 +4,10 @@ import os from "node:os";
 import path from "node:path";
 import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "@paperclipai/adapter-codex-local/server";
+import { writeExecutableNodeFixture } from "@paperclipai/shared/testing/node-script-fixture";
 
 async function writeFakeCodexCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-const fs = require("node:fs");
+  const script = `const fs = require("node:fs");
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
 const payload = {
@@ -32,17 +32,14 @@ console.log(JSON.stringify({ type: "thread.started", thread_id: "codex-session-1
 console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "hello" } }));
 console.log(JSON.stringify({ type: "turn.completed", usage: { input_tokens: 1, cached_input_tokens: 0, output_tokens: 1 } }));
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 async function writeFailingCodexCommand(commandPath: string, errorMessage: string): Promise<void> {
-  const script = `#!/usr/bin/env node
-console.log(JSON.stringify({ type: "error", message: ${JSON.stringify(errorMessage)} }));
+  const script = `console.log(JSON.stringify({ type: "error", message: ${JSON.stringify(errorMessage)} }));
 process.exit(1);
 `;
-  await fs.writeFile(commandPath, script, "utf8");
-  await fs.chmod(commandPath, 0o755);
+  await writeExecutableNodeFixture(commandPath, script);
 }
 
 type CapturePayload = {
@@ -706,14 +703,12 @@ describe("codex execute", () => {
     // Faithful to the observed MCP transport crash: the protocol stream starts,
     // then the process dies with only a harness tracing line on stderr — no
     // protocol-terminal event (error / turn.failed / turn.completed).
-    const script = `#!/usr/bin/env node
-console.log(JSON.stringify({ type: "thread.started", thread_id: "thread-crash-1" }));
+    const script = `console.log(JSON.stringify({ type: "thread.started", thread_id: "thread-crash-1" }));
 console.log(JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Starting the task." } }));
 console.error("2026-07-23T22:58:56.007042Z ERROR rmcp::transport::worker: worker quit with fatal: Transport channel closed, when UnexpectedContentType(Some(\\"text/plain\\"))");
 process.exit(1);
 `;
-    await fs.writeFile(commandPath, script, "utf8");
-    await fs.chmod(commandPath, 0o755);
+    await writeExecutableNodeFixture(commandPath, script);
 
     const previousHome = process.env.HOME;
     process.env.HOME = root;

@@ -29,11 +29,15 @@ const mockIssueService = vi.hoisted(() => ({
   listAttachments: vi.fn(),
   listComments: vi.fn(),
   listWakeableBlockedDependents: vi.fn(),
+  releaseTerminalRunLocks: vi.fn(),
   remove: vi.fn(),
   removeAttachment: vi.fn(),
   update: vi.fn(),
   findMentionedAgents: vi.fn(),
 }));
+
+/** The run lock these suites exercise is held by a live run (AND-12). */
+const liveRunLock = { checkoutRunId: "run-live-1", executionRunId: null };
 
 const mockAccessService = vi.hoisted(() => ({
   canUser: vi.fn(),
@@ -80,6 +84,7 @@ const mockStorageService = vi.hoisted(() => ({
   deleteObject: vi.fn(),
 }));
 const mockIssueThreadInteractionService = vi.hoisted(() => ({
+  create: vi.fn(),
   expirePendingInteractionsForTerminalIssue: vi.fn(async () => []),
   expireRequestConfirmationsSupersededByComment: vi.fn(async () => []),
   expireStaleRequestConfirmationsForIssueDocument: vi.fn(async () => []),
@@ -172,7 +177,14 @@ function registerRouteMocks() {
     documentService: () => mockDocumentService,
   }));
 
-  vi.doMock("../services/issues.js", () => ({
+  // AND-59: keep the real module's other exports alive. `routes/issues.ts`
+  // also imports value exports from here (`logExecutionLockLoss`, the
+  // diagnostics limits, `readAcceptedPlanConfirmationTarget`), and a factory
+  // that returns only `issueService` makes every one of those a hard
+  // "No export is defined on the mock" throw the moment a route reaches it —
+  // which turned the peer-checkout 409 into an unhandled 500.
+  vi.doMock("../services/issues.js", async (importOriginal) => ({
+    ...(await importOriginal<typeof import("../services/issues.js")>()),
     issueService: () => mockIssueService,
   }));
 
@@ -482,6 +494,8 @@ describe("agent issue mutation checkout ownership", () => {
     mockIssueService.listAttachments.mockReset();
     mockIssueService.listComments.mockReset();
     mockIssueService.listWakeableBlockedDependents.mockReset();
+    mockIssueService.releaseTerminalRunLocks.mockReset();
+    mockIssueService.releaseTerminalRunLocks.mockResolvedValue(liveRunLock);
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockReset();
     mockIssueThreadInteractionService.expireRequestConfirmationsSupersededByComment.mockResolvedValue([]);
     mockIssueThreadInteractionService.expireStaleRequestConfirmationsForIssueDocument.mockReset();
@@ -820,6 +834,26 @@ describe("agent issue mutation checkout ownership", () => {
           .attach("file", Buffer.from("report"), { filename: "report.txt", contentType: "text/plain" }),
     ],
     ["attachment delete", (app: express.Express) => request(app).delete("/api/attachments/attachment-1")],
+    // AND-38: interactions-create is a default-open write channel like comments,
+    // so it must sit in this table for the same reason the others do — the run
+    // lock is the only thing standing between a peer agent and a card posted
+    // into a run it does not own.
+    [
+      "interaction create",
+      (app: express.Express) =>
+        request(app).post(`/api/issues/${issueId}/interactions`).send({
+          kind: "ask_user_questions",
+          payload: {
+            version: 1,
+            questions: [{
+              id: "q1",
+              prompt: "Whose issue is this?",
+              selectionMode: "single",
+              options: [{ id: "a", label: "A" }, { id: "b", label: "B" }],
+            }],
+          },
+        }),
+    ],
   ])("rejects peer agent %s on another agent's active checkout", async (_name, sendRequest) => {
     const res = await sendRequest(await createApp(peerActor()));
 
@@ -837,6 +871,57 @@ describe("agent issue mutation checkout ownership", () => {
     expect(mockWorkProductService.update).not.toHaveBeenCalled();
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
     expect(mockStorageService.deleteObject).not.toHaveBeenCalled();
+    expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+    // AND-59: a refusal that leaves no evidence row reads downstream as an
+    // outage rather than a boundary, which is exactly how the unhandled 500
+    // presented. Pin the denial evidence to the same assertion table.
+    expect(mockLogActivity).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        companyId,
+        action: "issue.write_denied",
+        entityType: "issue",
+        entityId: issueId,
+        agentId: peerAgentId,
+        details: expect.objectContaining({ code: "issue_write_assignee_run_lock" }),
+      }),
+    );
+  });
+
+  // AND-12: the run lock is run-scoped, not status-scoped. When the run holding
+  // the checkout is terminal the lock must release rather than refuse every
+  // non-assignee actor forever — the denial copy already promises it "clears on
+  // its own", and before this nothing cleared it.
+  it("stops refusing a peer agent once the holding run is terminal", async () => {
+    mockIssueService.releaseTerminalRunLocks.mockResolvedValue({
+      checkoutRunId: null,
+      executionRunId: null,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Corrected by a peer" });
+
+    expect(mockIssueService.releaseTerminalRunLocks).toHaveBeenCalledWith(issueId);
+    expect(res.status, JSON.stringify(res.body)).not.toBe(409);
+    expect(res.body?.details?.code).not.toBe("issue_write_assignee_run_lock");
+  });
+
+  // The other half of the same boundary: a dead run releases, a live one does
+  // not. Without this the fix above could degrade into "never lock at all".
+  it("still refuses a peer agent while the holding run is live", async () => {
+    mockIssueService.releaseTerminalRunLocks.mockResolvedValue({
+      checkoutRunId: "run-live-1",
+      executionRunId: null,
+    });
+
+    const res = await request(await createApp(peerActor()))
+      .patch(`/api/issues/${issueId}`)
+      .send({ title: "Blocked" });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(409);
+    expect(res.body.details.code).toBe("issue_write_assignee_run_lock");
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
   it("allows mentioned peer agents to post comments without ownership of an active checkout", async () => {
@@ -942,6 +1027,62 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.body.error).toBe("Issue is outside this actor's authorization boundary");
     expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:read" }));
     expect(mockIssueThreadInteractionService.listForIssue).not.toHaveBeenCalled();
+  });
+
+  // AND-38: the read side of this route was already pinned (above); the write
+  // side was not. `assertAgentIssueMutationAllowed` runs the boundary decision
+  // before any assignee/run-lock reasoning, so an out-of-boundary peer must be
+  // refused here for the same reason it is refused on patch and comments —
+  // and must never reach the service that would insert the card.
+  it("rejects peer agents from creating interactions when the issue is outside their boundary", async () => {
+    mockAccessService.decide.mockImplementation(async (input: { action: string }) => ({
+      allowed: false,
+      action: input.action,
+      reason: "deny_low_trust_boundary",
+      explanation: "Issue is outside this low-trust boundary.",
+    }));
+
+    const res = await request(await createApp(peerActor()))
+      .post(`/api/issues/${issueId}/interactions`)
+      .send({
+        kind: "ask_user_questions",
+        payload: {
+          version: 1,
+          questions: [{
+            id: "q1",
+            prompt: "Outside the boundary.",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }, { id: "b", label: "B" }],
+          }],
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(403);
+    expect(mockAccessService.decide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:mutate" }));
+    expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
+  });
+
+  // The cross-tenant half: same no-existence-oracle contract the comments route
+  // already carries. A foreign-company agent must not learn the issue exists.
+  it("denies cross-company agents on interaction create before authorization is evaluated", async () => {
+    const res = await request(await createApp(peerActor({ companyId: "99999999-9999-4999-8999-999999999999" })))
+      .post(`/api/issues/${issueId}/interactions`)
+      .send({
+        kind: "ask_user_questions",
+        payload: {
+          version: 1,
+          questions: [{
+            id: "q1",
+            prompt: "Wrong company.",
+            selectionMode: "single",
+            options: [{ id: "a", label: "A" }, { id: "b", label: "B" }],
+          }],
+        },
+      });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(404);
+    expect(res.body.error).toBe("Issue not found");
+    expect(mockIssueThreadInteractionService.create).not.toHaveBeenCalled();
   });
 
   it("allows mentioned peer agents to list comments through an issue read grant", async () => {
