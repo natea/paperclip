@@ -414,6 +414,82 @@ describeEmbeddedPostgres("recovery sweepStaleIssueLocks", () => {
     expect(runStatus).toBe("cancelled");
   });
 
+  it("does not terminalize a run dispatched onto an issue that was already done (AND-81)", async () => {
+    // A resume/comment wake on a done issue starts a run whose issue is terminal
+    // by design. Before its process spawns there is no pid, so only the
+    // issue-terminal authority could fire. It must not: the issue closed before
+    // the run started, so the run is young, not orphaned.
+    const { companyId, agentId, runningRunId } = await seed();
+    const runStartedAt = new Date();
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: runStartedAt, processPid: null, processStartedAt: null })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Done issue woken by a resume comment",
+      status: "done",
+      completedAt: new Date(runStartedAt.getTime() - 60_000),
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+    await db
+      .update(heartbeatRuns)
+      .set({ contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, runningRunId));
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([]);
+    expect(result.cleared).toBe(0);
+    const run = await db
+      .select({ status: heartbeatRuns.status, finishedAt: heartbeatRuns.finishedAt })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runningRunId))
+      .then((rows) => rows[0]);
+    expect(run).toEqual({ status: "running", finishedAt: null });
+    const lock = await db
+      .select({ checkoutRunId: issues.checkoutRunId, executionRunId: issues.executionRunId })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0]);
+    expect(lock).toEqual({ checkoutRunId: runningRunId, executionRunId: runningRunId });
+  });
+
+  it("still terminalizes a running run whose issue reached done after the run started", async () => {
+    const { companyId, agentId, runningRunId } = await seed();
+    const runStartedAt = new Date(Date.now() - 60_000);
+    await db
+      .update(heartbeatRuns)
+      .set({ startedAt: runStartedAt, processPid: process.pid })
+      .where(eq(heartbeatRuns.id, runningRunId));
+    const issueId = randomUUID();
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Issue closed mid-run, run row stayed running",
+      status: "done",
+      completedAt: new Date(),
+      priority: "high",
+      assigneeAgentId: agentId,
+      checkoutRunId: runningRunId,
+      executionRunId: runningRunId,
+      executionLockedAt: new Date(),
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.sweepStaleIssueLocks();
+
+    expect(result.terminalizedRunIds).toEqual([runningRunId]);
+    expect(result.cleared).toBe(1);
+  });
+
   it("does not terminalize a running run whose process is alive and whose issue is not terminal", async () => {
     const { companyId, agentId, runningRunId } = await seed();
     // process.pid is the live test process, so isPidAlive returns true.

@@ -4860,6 +4860,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       // column. It maps issue "done" to "succeeded" and issue "cancelled" to
       // "cancelled". A null value means the referencing issue is not terminal.
       referencingIssueTerminalStatus?: "succeeded" | "cancelled" | null;
+      // When the referencing issue reached its terminal status (completedAt or
+      // cancelledAt). Used to tell an orphan apart from a run deliberately
+      // dispatched onto an issue that was already terminal.
+      referencingIssueTerminalAt?: Date | null;
       // True when an active (non-terminal) issue still holds this run in a lock
       // column. The run is live for that active issue, so the caller forbids the
       // issue-terminal authority. This flag also suppresses the context-snapshot
@@ -4886,15 +4890,46 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // terminalize it.
     let issueTerminalStatus: "succeeded" | "cancelled" | null =
       options?.referencingIssueTerminalStatus ?? null;
+    let issueTerminalAt: Date | null = issueTerminalStatus
+      ? options?.referencingIssueTerminalAt ?? null
+      : null;
     const issueId = issueIdFromRunContext(run.contextSnapshot);
     if (!issueTerminalStatus && !options?.runReferencedByActiveIssue && issueId) {
-      const issueStatus = await db
-        .select({ status: issues.status })
+      const issueRow = await db
+        .select({
+          status: issues.status,
+          completedAt: issues.completedAt,
+          cancelledAt: issues.cancelledAt,
+        })
         .from(issues)
         .where(eq(issues.id, issueId))
-        .then((rows) => rows[0]?.status ?? null);
-      if (issueStatus === "done") issueTerminalStatus = "succeeded";
-      else if (issueStatus === "cancelled") issueTerminalStatus = "cancelled";
+        .then((rows) => rows[0] ?? null);
+      if (issueRow?.status === "done") {
+        issueTerminalStatus = "succeeded";
+        issueTerminalAt = issueRow.completedAt;
+      } else if (issueRow?.status === "cancelled") {
+        issueTerminalStatus = "cancelled";
+        issueTerminalAt = issueRow.cancelledAt;
+      }
+    }
+
+    // The issue-terminal authority exists for a run left "running" after its
+    // issue closed. A run dispatched onto an issue that was already terminal
+    // (a resume comment wake, a human comment on a done issue, monitor
+    // maintenance) is terminal-issue work by design, not an orphan. Without
+    // this guard the sweep finalizes such a run seconds after it starts, before
+    // its process is even spawned, and releases the issue lock under it. When
+    // the issue's terminal timestamp provably predates the run's start, drop
+    // the authority and let only the process-death authority decide. A missing
+    // timestamp proves nothing, so the authority stays in force.
+    const runStartedAt = run.startedAt ?? run.createdAt;
+    if (
+      issueTerminalStatus &&
+      issueTerminalAt &&
+      runStartedAt &&
+      issueTerminalAt.getTime() <= runStartedAt.getTime()
+    ) {
+      issueTerminalStatus = null;
     }
 
     // Process-death authority. The run is live only when a process still backs
@@ -5027,6 +5062,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         id: issues.id,
         companyId: issues.companyId,
         status: issues.status,
+        completedAt: issues.completedAt,
+        cancelledAt: issues.cancelledAt,
         checkoutRunId: issues.checkoutRunId,
         executionRunId: issues.executionRunId,
       })
@@ -5072,6 +5109,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // "cancelled". Skip a run that an active issue also references, because that
     // run is still live for the active issue.
     const issueTerminalStatusByRunId = new Map<string, "succeeded" | "cancelled">();
+    const issueTerminalAtByRunId = new Map<string, Date | null>();
     for (const issue of candidates) {
       const implied =
         issue.status === "done"
@@ -5083,6 +5121,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       for (const runId of [issue.checkoutRunId, issue.executionRunId]) {
         if (runId && !runIdsReferencedByActiveIssue.has(runId)) {
           issueTerminalStatusByRunId.set(runId, implied);
+          issueTerminalAtByRunId.set(
+            runId,
+            issue.status === "done" ? issue.completedAt : issue.cancelledAt,
+          );
         }
       }
     }
@@ -5094,6 +5136,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     for (const row of runRows) {
       const outcome = await terminalizeOrphanedRunningRun(row, {
         referencingIssueTerminalStatus: issueTerminalStatusByRunId.get(row.id) ?? null,
+        referencingIssueTerminalAt: issueTerminalAtByRunId.get(row.id) ?? null,
         runReferencedByActiveIssue: runIdsReferencedByActiveIssue.has(row.id),
       });
       runStatusById.set(row.id, outcome.status);
