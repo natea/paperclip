@@ -1227,6 +1227,21 @@ const healthServerInfoSchema = z.object({
       unavailableReason: z.enum(["git_unavailable", "invalid_git_metadata"]),
     }).strict(),
   ]),
+  // Required and never null on current code (AND-85): an absent or null value
+  // means the answering process predates the drift reporter (AND-69).
+  freshness: z.union([
+    z.object({
+      status: z.literal("unknown"),
+      reason: z.enum(["git_unavailable_at_boot", "git_unavailable_now"]),
+    }).strict(),
+    z.object({
+      status: z.enum(["current", "behind"]),
+      bootSha: z.string(),
+      bootHadLocalChanges: z.boolean().nullable(),
+      headSha: z.string(),
+      behindByCommits: z.number().int().nonnegative().nullable(),
+    }).strict(),
+  ]),
 }).strict();
 
 registry.registerPath({

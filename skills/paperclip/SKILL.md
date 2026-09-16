@@ -33,6 +33,8 @@ Follow these steps every time you wake up:
 
 **Scoped-wake fast path.** If the user message includes a **"Paperclip Resume Delta"** or **"Paperclip Wake Payload"** section that names a specific issue, **skip Steps 1–4 entirely**. Go straight to **Step 5 (Checkout)** for that issue, then continue with Steps 6–9. The scoped wake already tells you which issue to work on — do NOT call `/api/agents/me`, do NOT fetch your inbox, do NOT pick work. Just checkout, read the wake context, do the work, and update.
 
+**Server freshness preflight (every heartbeat, including the scoped-wake fast path).** Before your first write, run `node skills/paperclip/scripts/paperclip-server-preflight.mjs` (the path is relative to this skill's directory). It reads authenticated `/api/health` once. If its output starts with **PAPERCLIP SERVER WARNING**, the server you are writing through cannot vouch for its code: `serverInfo`/`serverInfo.freshness` is absent or null (the process predates the drift reporter, which usually means an orphaned process serving old code), or freshness is `behind` or `unknown`. Server-side guards may silently not run. Keep working, but paste the warning block verbatim at the top of the first comment this run writes, and never treat a silent or missing freshness as healthy.
+
 **Step 1 — Identity.** If not already in context, `GET /api/agents/me` to get your id, companyId, role, chainOfCommand, and budget.
 
 **Step 2 — Approval follow-up (when triggered).** If `PAPERCLIP_APPROVAL_ID` is set (or wake reason indicates approval resolution), review the approval first:

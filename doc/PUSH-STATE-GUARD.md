@@ -201,3 +201,14 @@ projectId was set by an earlier PATCH"` pins that.
 The residual is operational, not code: an orphaned server process serving stale
 code on the port agents are pointed at. Nothing in the control plane detects or
 refuses that today.
+
+### Detection from the agent side (AND-85)
+
+An old binary cannot be patched to warn about itself, so the check lives with
+the caller. Current servers never return `serverInfo.freshness: null` (git
+unavailable is an explicit `{status: "unknown", reason}`), which leaves
+absent/null with one meaning: the process predates the drift reporter. The
+Paperclip skill runs `skills/paperclip/scripts/paperclip-server-preflight.mjs`
+once per heartbeat; it prints a **PAPERCLIP SERVER WARNING** naming the port,
+`processStartedAt` and `version` when freshness is absent, null, `behind` or
+`unknown`, and the skill has the run paste that block into its first comment.

@@ -339,4 +339,37 @@ describe("runtime freshness (AND-69)", () => {
       reason: "git_unavailable_at_boot",
     });
   });
+
+  // AND-85: `freshness: null` must mean exactly one thing — the answering
+  // process predates this reporter. So current code reports an explicit
+  // `unknown` on every git-unavailable path instead of going quiet.
+  it("never reports null freshness when git is unavailable at boot and now", () => {
+    const noGit = () => {
+      throw new Error("git: command not found");
+    };
+    const created = createServerInfoSnapshot({
+      gitCommand: noGit,
+      buildCommitCommand: () => null,
+    });
+    expect(created.freshness).toEqual({ status: "unknown", reason: "git_unavailable_at_boot" });
+
+    resetServerInfoCacheForTests({ bootGit: null });
+    const live = getServerInfoSnapshot({ now: 0, gitCommand: noGit, buildCommitCommand: () => null });
+    expect(live.freshness).not.toBeNull();
+    expect(live.freshness).toEqual({ status: "unknown", reason: expect.any(String) });
+  });
+
+  it("reports unknown, not null, when git disappears after boot", () => {
+    resetServerInfoCacheForTests({ bootGit: bootGitInfoFor("aaaaaaa") });
+
+    const snapshot = getServerInfoSnapshot({
+      now: 0,
+      gitCommand: () => {
+        throw new Error("git: command not found");
+      },
+      buildCommitCommand: () => null,
+    });
+
+    expect(snapshot.freshness).toEqual({ status: "unknown", reason: "git_unavailable_now" });
+  });
 });
